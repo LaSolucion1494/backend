@@ -1,19 +1,26 @@
 import { Router } from "express"
 import { check } from "express-validator"
-import { getConfig, getConfigByKey, updateConfig, updateConfigByKey } from "../controllers/config.controller.js"
+import { getConfig, updateConfig, recalculateAllPrices } from "../controllers/config.controller.js"
 import { verifyToken } from "../middlewares/verifyToken.js"
 
 const router = Router()
 
 // Validaciones para actualizar configuración
-const validateConfigSchema = [check("configs").isArray().withMessage("Se esperaba un array de configuraciones")]
+const validateConfigSchema = [
+  check("configs").isArray({ min: 1 }).withMessage("Se esperaba un array de configuraciones no vacío"),
+  check("configs.*.clave").notEmpty().withMessage("La clave de configuración es obligatoria"),
+  check("configs.*.valor").notEmpty().withMessage("El valor de la configuración es obligatorio"),
+]
 
-const validateSingleConfigSchema = [check("valor").notEmpty().withMessage("El valor es obligatorio")]
+// --- Rutas de Configuración ---
 
-// Rutas
+// Obtener toda la configuración
 router.get("/", verifyToken(), getConfig)
-router.get("/:key", verifyToken(), getConfigByKey)
+
+// Actualizar una o varias configuraciones
 router.put("/", verifyToken(["admin"]), validateConfigSchema, updateConfig)
-router.put("/:key", verifyToken(["admin"]), validateSingleConfigSchema, updateConfigByKey)
+
+// Forzar el recálculo de todos los precios de venta
+router.post("/recalculate-prices", verifyToken(["admin"]), recalculateAllPrices)
 
 export default router

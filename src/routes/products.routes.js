@@ -8,6 +8,7 @@ import {
   deleteProduct,
   getProductByCode,
   validateProductCode,
+  getProductPriceBreakdown, // Importado
 } from "../controllers/products.controller.js"
 import { verifyToken } from "../middlewares/verifyToken.js"
 
@@ -28,21 +29,19 @@ const validateProductUpdateSchema = [
   check("precioCosto").isFloat({ min: 0 }).withMessage("El precio de costo debe ser un número positivo"),
 ]
 
-// Rutas públicas (requieren autenticación básica)
+// --- Rutas de Productos ---
+
 router.get("/", verifyToken(), getProducts)
 router.get("/:id", verifyToken(), getProductById)
 
-// Ruta para buscar por código
+// Nueva ruta para obtener el desglose de precios de un producto
+router.get("/:id/price-breakdown", verifyToken(), getProductPriceBreakdown)
+
 router.get("/code/:code", verifyToken(), getProductByCode)
-
-// Ruta para validar código único
 router.post("/validate-code", verifyToken(), validateProductCode)
-
-// Rutas que requieren autenticación
 router.post("/", verifyToken(), validateProductSchema, createProduct)
 router.put("/:id", verifyToken(), validateProductUpdateSchema, updateProduct)
-
-// Ruta que requiere permisos de admin
 router.delete("/:id", verifyToken(["admin"]), deleteProduct)
 
 export default router
+ 

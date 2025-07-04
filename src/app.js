@@ -1,3 +1,4 @@
+// app.js
 import express from "express"
 import cors from "cors"
 import bodyParser from "body-parser"
@@ -10,10 +11,11 @@ import categoriesRoutes from "./routes/categories.routes.js"
 import suppliersRoutes from "./routes/suppliers.routes.js"
 import stockMovementsRoutes from "./routes/stockMovements.routes.js"
 import configRoutes from "./routes/config.routes.js"
-import purchasesRoutes from "./routes/compras/purchases.routes.js"
+import purchasesRoutes from "./routes/purchases.routes.js"
 import clientsRoutes from "./routes/clients.routes.js"
 import salesRoutes from "./routes/sales.routes.js"
 import cashClosingRoutes from "./routes/cashClosing.routes.js"
+import cuentaCorrienteRoutes from "./routes/cuentaCorriente.routes.js" // NUEVO
 
 const app = express()
 
@@ -52,9 +54,10 @@ app.use("/api/suppliers", suppliersRoutes)
 app.use("/api/stock-movements", stockMovementsRoutes)
 app.use("/api/config", configRoutes)
 app.use("/api/purchases", purchasesRoutes)
-app.use("/api/clientes", clientsRoutes) // CAMBIADO: de /api/clients a /api/clientes
+app.use("/api/clientes", clientsRoutes)
 app.use("/api/sales", salesRoutes)
 app.use("/api/cash-closing", cashClosingRoutes)
+app.use("/api/cuenta-corriente", cuentaCorrienteRoutes) // NUEVA RUTA
 
 // Middleware para manejar errores
 app.use((err, req, res, next) => {
