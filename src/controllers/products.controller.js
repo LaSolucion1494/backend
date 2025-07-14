@@ -50,8 +50,14 @@ export const getProductByCode = async (req, res) => {
         p.id, p.codigo, p.nombre, p.descripcion, p.marca, p.stock, p.stock_minimo,
         p.precio_costo, p.precio_venta, p.tiene_codigo_barras as tieneCodigoBarras,
         p.fecha_ingreso as fechaIngreso, p.activo, p.categoria_id, p.proveedor_id,
-        COALESCE(c.nombre, 'Sin Categoría') as categoria,
-        COALESCE(pr.nombre, 'Sin Proveedor') as proveedor
+        COALESCE(c.nombre, 'Sin Categoría') as categoria_nombre,
+        COALESCE(pr.nombre, 'Sin Proveedor') as proveedor,
+        -- NUEVO: Obtener stock mínimo configurado por el usuario
+        COALESCE(
+          (SELECT valor FROM configuracion WHERE clave = 'stock_minimo_default'), 
+          p.stock_minimo, 
+          5
+        ) as stock_minimo_config
       FROM productos p
       LEFT JOIN categorias c ON p.categoria_id = c.id
       LEFT JOIN proveedores pr ON p.proveedor_id = pr.id
@@ -71,7 +77,7 @@ export const getProductByCode = async (req, res) => {
   }
 }
 
-// Obtener todos los productos con filtros
+// ACTUALIZADO: Obtener todos los productos con filtros y PAGINACIÓN
 export const getProducts = async (req, res) => {
   try {
     const {
@@ -83,15 +89,11 @@ export const getProducts = async (req, res) => {
       maxPrice = "",
       sortBy = "nombre",
       sortOrder = "asc",
+      limit = 10,
+      offset = 0,
     } = req.query
 
-    let query = `
-      SELECT 
-        p.id, p.codigo, p.nombre, p.descripcion, p.marca, p.stock, p.stock_minimo,
-        p.precio_costo, p.precio_venta, p.tiene_codigo_barras as tieneCodigoBarras,
-        p.fecha_ingreso as fechaIngreso, p.activo, p.proveedor_id,
-        COALESCE(c.nombre, 'Sin Categoría') as categoria,
-        COALESCE(pr.nombre, 'Sin Proveedor') as proveedor
+    let baseQuery = `
       FROM productos p
       LEFT JOIN categorias c ON p.categoria_id = c.id
       LEFT JOIN proveedores pr ON p.proveedor_id = pr.id
@@ -99,43 +101,80 @@ export const getProducts = async (req, res) => {
     `
     const queryParams = []
 
-    if (activo === "true") query += ` AND p.activo = TRUE`
-    else if (activo === "false") query += ` AND p.activo = FALSE`
+    if (activo === "true") baseQuery += ` AND p.activo = TRUE`
+    else if (activo === "false") baseQuery += ` AND p.activo = FALSE`
 
     if (search) {
-      query += ` AND (p.codigo LIKE ? OR p.nombre LIKE ? OR p.descripcion LIKE ? OR p.marca LIKE ?)`
+      baseQuery += ` AND (p.codigo LIKE ? OR p.nombre LIKE ? OR p.descripcion LIKE ? OR p.marca LIKE ?)`
       const searchTerm = `%${search}%`
       queryParams.push(searchTerm, searchTerm, searchTerm, searchTerm)
     }
 
     if (categoria && categoria !== "Todos") {
-      query += ` AND c.nombre = ?`
+      baseQuery += ` AND c.nombre = ?`
       queryParams.push(categoria)
     }
 
-    if (stockStatus === "disponible") query += ` AND p.stock > 0`
-    else if (stockStatus === "bajo") query += ` AND p.stock <= p.stock_minimo AND p.stock > 0`
-    else if (stockStatus === "agotado") query += ` AND p.stock = 0`
+    if (stockStatus === "disponible") baseQuery += ` AND p.stock > 0`
+    else if (stockStatus === "bajo") baseQuery += ` AND p.stock <= p.stock_minimo AND p.stock > 0`
+    else if (stockStatus === "agotado") baseQuery += ` AND p.stock = 0`
 
     if (minPrice) {
-      query += ` AND p.precio_venta >= ?`
+      baseQuery += ` AND p.precio_venta >= ?`
       queryParams.push(Number.parseFloat(minPrice))
     }
     if (maxPrice) {
-      query += ` AND p.precio_venta <= ?`
+      baseQuery += ` AND p.precio_venta <= ?`
       queryParams.push(Number.parseFloat(maxPrice))
     }
 
-    const validSortFields = ["nombre", "codigo", "stock", "precio_costo", "precio_venta", "categoria", "marca"]
+    // Consulta de conteo
+    const countQuery = `SELECT COUNT(*) as total ${baseQuery}`
+    const [[{ total }]] = await pool.query(countQuery, queryParams)
+
+    // Consulta de datos con paginación
+    let dataQuery = `
+      SELECT 
+        p.id, p.codigo, p.nombre, p.descripcion, p.marca, p.stock, p.stock_minimo,
+        p.precio_costo, p.precio_venta, p.tiene_codigo_barras as tieneCodigoBarras,
+        p.fecha_ingreso as fechaIngreso, p.activo, p.proveedor_id,
+        COALESCE(c.nombre, 'Sin Categoría') as categoria_nombre,
+        COALESCE(pr.nombre, 'Sin Proveedor') as proveedor,
+        -- NUEVO: Obtener stock mínimo configurado por el usuario
+        COALESCE(
+          (SELECT valor FROM configuracion WHERE clave = 'stock_minimo_default'), 
+          p.stock_minimo, 
+          5
+        ) as stock_minimo_config
+      ${baseQuery}
+    `
+
+    const validSortFields = ["nombre", "codigo", "stock", "precio_costo", "precio_venta", "categoria_nombre", "marca"]
     if (validSortFields.includes(sortBy)) {
-      query += ` ORDER BY ${sortBy === "categoria" ? "c.nombre" : `p.${sortBy}`} ${sortOrder === "desc" ? "DESC" : "ASC"}`
+      dataQuery += ` ORDER BY ${sortBy === "categoria_nombre" ? "c.nombre" : `p.${sortBy}`} ${sortOrder === "desc" ? "DESC" : "ASC"}`
     }
 
-    const [products] = await pool.query(query, queryParams)
-    res.status(200).json(products)
+    dataQuery += ` LIMIT ? OFFSET ?`
+    const finalDataParams = [...queryParams, Number.parseInt(limit), Number.parseInt(offset)]
+    const [products] = await pool.query(dataQuery, finalDataParams)
+
+    res.status(200).json({
+      success: true,
+      data: products,
+      pagination: {
+        totalItems: total,
+        totalPages: Math.ceil(total / limit),
+        currentPage: Math.floor(offset / limit) + 1,
+        itemsPerPage: Number.parseInt(limit),
+      },
+    })
   } catch (error) {
     console.error("Error al obtener productos:", error)
-    res.status(500).json({ message: "Error al obtener productos" })
+    res.status(500).json({
+      success: false,
+      message: "Error al obtener productos",
+      error: error.message,
+    })
   }
 }
 
@@ -149,8 +188,14 @@ export const getProductById = async (req, res) => {
         p.id, p.codigo, p.nombre, p.descripcion, p.marca, p.stock, p.stock_minimo,
         p.precio_costo, p.precio_venta, p.tiene_codigo_barras as tieneCodigoBarras,
         p.fecha_ingreso as fechaIngreso, p.activo, p.categoria_id, p.proveedor_id,
-        COALESCE(c.nombre, 'Sin Categoría') as categoria,
-        COALESCE(pr.nombre, 'Sin Proveedor') as proveedor
+        COALESCE(c.nombre, 'Sin Categoría') as categoria_nombre,
+        COALESCE(pr.nombre, 'Sin Proveedor') as proveedor,
+        -- NUEVO: Obtener stock mínimo configurado por el usuario
+        COALESCE(
+          (SELECT valor FROM configuracion WHERE clave = 'stock_minimo_default'), 
+          p.stock_minimo, 
+          5
+        ) as stock_minimo_config
       FROM productos p
       LEFT JOIN categorias c ON p.categoria_id = c.id
       LEFT JOIN proveedores pr ON p.proveedor_id = pr.id
@@ -323,6 +368,65 @@ export const updateProduct = async (req, res) => {
   }
 }
 
+// NUEVA FUNCIÓN: Actualizar solo los precios de un producto
+export const updateProductPrices = async (req, res) => {
+  const errors = validationResult(req)
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() })
+  }
+
+  try {
+    const { id } = req.params
+    const { precio_costo, precio_venta } = req.body
+
+    // Validar que el producto existe
+    const [existingProduct] = await pool.query("SELECT id, nombre, codigo FROM productos WHERE id = ?", [id])
+    if (existingProduct.length === 0) {
+      return res.status(404).json({ message: "Producto no encontrado" })
+    }
+
+    // Validar precio de costo
+    if (!isValidPrice(precio_costo)) {
+      return res.status(400).json({ message: "El precio de costo debe ser un número válido mayor o igual a 0" })
+    }
+
+    let finalPrecioVenta = precio_venta
+
+    // Si no se proporciona precio de venta, calcularlo automáticamente
+    if (!precio_venta) {
+      const pricingConfig = await getPricingConfig(pool)
+      finalPrecioVenta = calculateSalePrice(precio_costo, pricingConfig)
+    }
+
+    // Validar precio de venta final
+    if (!isValidPrice(finalPrecioVenta)) {
+      return res.status(400).json({ message: "Error al calcular o validar el precio de venta" })
+    }
+
+    // Actualizar solo los precios
+    await pool.query("UPDATE productos SET precio_costo = ?, precio_venta = ? WHERE id = ?", [
+      precio_costo,
+      finalPrecioVenta,
+      id,
+    ])
+
+    // Obtener desglose del cálculo para información
+    const pricingConfig = await getPricingConfig(pool)
+    const breakdown = getPriceBreakdown(precio_costo, pricingConfig)
+
+    res.status(200).json({
+      message: "Precios actualizados exitosamente",
+      producto: existingProduct[0],
+      precio_costo_nuevo: precio_costo,
+      precio_venta_nuevo: finalPrecioVenta,
+      desglose_calculo: breakdown,
+    })
+  } catch (error) {
+    console.error("Error al actualizar precios del producto:", error)
+    res.status(500).json({ message: "Error al actualizar precios del producto" })
+  }
+}
+
 // Eliminar un producto (eliminación lógica o permanente)
 export const deleteProduct = async (req, res) => {
   const connection = await pool.getConnection()
@@ -400,5 +504,83 @@ export const getProductPriceBreakdown = async (req, res) => {
   } catch (error) {
     console.error("Error al obtener desglose de precios:", error)
     res.status(500).json({ message: "Error al obtener desglose de precios" })
+  }
+}
+
+export const searchProducts = async (req, res) => {
+  try {
+    const { search = "", limit = 10, includeOutOfStock = true } = req.query
+
+    console.log("searchProducts called with:", { search, limit, includeOutOfStock })
+
+    if (!search || search.trim().length < 2) {
+      return res.status(400).json({
+        success: false,
+        message: "El término de búsqueda debe tener al menos 2 caracteres",
+      })
+    }
+
+    let baseQuery = `
+      SELECT 
+        p.id, p.codigo, p.nombre, p.descripcion, p.marca, p.stock, p.stock_minimo,
+        p.precio_costo, p.precio_venta, p.tiene_codigo_barras as tieneCodigoBarras,
+        p.fecha_ingreso as fechaIngreso, p.activo, p.categoria_id, p.proveedor_id,
+        COALESCE(c.nombre, 'Sin Categoría') as categoria_nombre,
+        COALESCE(pr.nombre, 'Sin Proveedor') as proveedor_nombre
+      FROM productos p
+      LEFT JOIN categorias c ON p.categoria_id = c.id
+      LEFT JOIN proveedores pr ON p.proveedor_id = pr.id
+      WHERE p.activo = TRUE
+    `
+
+    const queryParams = []
+    const searchTerm = `%${search.trim()}%`
+
+    // Búsqueda en múltiples campos
+    baseQuery += ` AND (
+      p.codigo LIKE ? OR 
+      p.nombre LIKE ? OR 
+      p.descripcion LIKE ? OR 
+      p.marca LIKE ? OR
+      c.nombre LIKE ?
+    )`
+    queryParams.push(searchTerm, searchTerm, searchTerm, searchTerm, searchTerm)
+
+    // Filtro de stock si se especifica
+    if (includeOutOfStock === "false") {
+      baseQuery += ` AND p.stock > 0`
+    }
+
+    // Ordenar por relevancia: primero por código exacto, luego por nombre
+    baseQuery += ` ORDER BY 
+      CASE WHEN p.codigo = ? THEN 1 ELSE 2 END,
+      CASE WHEN p.nombre LIKE ? THEN 1 ELSE 2 END,
+      p.nombre ASC
+    `
+    queryParams.push(search.trim(), `${search.trim()}%`)
+
+    // Limitar resultados
+    baseQuery += ` LIMIT ?`
+    queryParams.push(Number.parseInt(limit))
+
+    console.log("Executing search query with params:", queryParams)
+
+    const [products] = await pool.query(baseQuery, queryParams)
+
+    console.log(`Found ${products.length} products for search: "${search}"`)
+
+    res.status(200).json({
+      success: true,
+      data: products,
+      searchTerm: search,
+      totalResults: products.length,
+    })
+  } catch (error) {
+    console.error("Error en búsqueda de productos:", error)
+    res.status(500).json({
+      success: false,
+      message: "Error en la búsqueda de productos",
+      error: error.message,
+    })
   }
 }

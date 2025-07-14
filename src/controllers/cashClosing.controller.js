@@ -1,69 +1,106 @@
 import pool from "../db.js"
 import { validationResult } from "express-validator"
 
-// Obtener resumen de ventas del día para cierre
-export const getDailySalesSummary = async (req, res) => {
+// Helper para actualizar la última fecha y hora de cierre de caja
+const updateLastCashClosingDateTime = async (connection, newDateTime) => {
+  await connection.query("UPDATE configuracion SET valor = ? WHERE clave = 'ultima_fecha_hora_cierre_caja'", [
+    newDateTime,
+  ])
+}
+
+// Obtener datos para el cierre de caja pendiente (desde el último cierre hasta ahora)
+export const getPendingCashClosingData = async (req, res) => {
+  const connection = await pool.getConnection()
   try {
-    const { fecha } = req.query
-    const targetDate = fecha || new Date().toISOString().split("T")[0]
+    const { fechaInicio, horaInicio, fechaFin, horaFin, tipoCierre } = req.query
 
-    // Obtener ventas del día agrupadas por método de pago
-    const [salesByPayment] = await pool.query(
+    const startDateTime = `${fechaInicio} ${horaInicio}`
+    const endDateTime = `${fechaFin} ${horaFin}`
+
+    // Obtener pagos de ventas en el período
+    const [salesPayments] = await connection.query(
       `
-      SELECT 
-        tipo_pago,
-        COUNT(*) as cantidad_ventas,
-        SUM(total) as total_monto,
-        SUM(descuento) as total_descuentos
-      FROM ventas 
-      WHERE DATE(fecha_venta) = ? AND estado = 'completada'
-      GROUP BY tipo_pago
-      ORDER BY tipo_pago
+      SELECT vp.tipo_pago, SUM(vp.monto) as total_monto, COUNT(*) as cantidad_transacciones
+      FROM venta_pagos vp
+      JOIN ventas v ON vp.venta_id = v.id
+      WHERE v.fecha_creacion >= ? AND v.fecha_creacion <= ? AND v.estado = 'completada'
+      GROUP BY vp.tipo_pago
     `,
-      [targetDate],
+      [startDateTime, endDateTime],
     )
 
-    // Obtener total general del día
-    const [totalDay] = await pool.query(
+    // CAMBIO IMPORTANTE: Usar fecha_creacion para pagos de clientes a cuenta corriente
+    const [clientPayments] = await connection.query(
       `
-      SELECT 
-        COUNT(*) as total_ventas,
-        SUM(total) as monto_total,
-        SUM(descuento) as descuentos_total,
-        SUM(subtotal) as subtotal_total
-      FROM ventas 
-      WHERE DATE(fecha_venta) = ? AND estado = 'completada'
+      SELECT pcc.tipo_pago, SUM(pcc.monto) as total_monto, COUNT(*) as cantidad_transacciones
+      FROM pagos_cuenta_corriente pcc
+      WHERE pcc.fecha_creacion >= ? AND pcc.fecha_creacion <= ? AND pcc.estado = 'activo'
+      GROUP BY pcc.tipo_pago
     `,
-      [targetDate],
+      [startDateTime, endDateTime],
     )
 
-    // Verificar si ya existe un cierre para esta fecha
-    const [existingClosing] = await pool.query(
-      `
-      SELECT id FROM cierres_caja 
-      WHERE DATE(fecha_cierre) = ?
-    `,
-      [targetDate],
-    )
+    let purchasePayments = []
+    if (tipoCierre === "full") {
+      // Obtener pagos de compras en el período (solo si es cierre 'full')
+      ;[purchasePayments] = await connection.query(
+        `
+        SELECT cp.tipo_pago, SUM(cp.monto) as total_monto, COUNT(*) as cantidad_transacciones
+        FROM compra_pagos cp
+        JOIN compras c ON cp.compra_id = c.id
+        WHERE c.fecha_creacion >= ? AND c.fecha_creacion <= ? AND c.estado != 'cancelada'
+        GROUP BY cp.tipo_pago
+      `,
+        [startDateTime, endDateTime],
+      )
+    }
+
+    // Calcular totales
+    let totalVentas = 0
+    let totalCompras = 0
+    let ingresosEfectivo = 0
+    let egresosEfectivo = 0
+
+    salesPayments.forEach((p) => {
+      totalVentas += Number.parseFloat(p.total_monto)
+      if (p.tipo_pago === "efectivo") ingresosEfectivo += Number.parseFloat(p.total_monto)
+    })
+
+    clientPayments.forEach((p) => {
+      if (p.tipo_pago === "efectivo") ingresosEfectivo += Number.parseFloat(p.total_monto)
+    })
+
+    purchasePayments.forEach((p) => {
+      totalCompras += Number.parseFloat(p.total_monto)
+      if (p.tipo_pago === "efectivo") egresosEfectivo += Number.parseFloat(p.total_monto)
+    })
 
     res.status(200).json({
-      fecha: targetDate,
-      ventasPorTipoPago: salesByPayment,
-      resumenTotal: totalDay[0] || {
-        total_ventas: 0,
-        monto_total: 0,
-        descuentos_total: 0,
-        subtotal_total: 0,
+      success: true,
+      data: {
+        fechaInicio: fechaInicio,
+        horaInicio: horaInicio,
+        fechaFin: fechaFin,
+        horaFin: horaFin,
+        totalVentas: totalVentas,
+        totalCompras: totalCompras,
+        ingresosEfectivo: ingresosEfectivo,
+        egresosEfectivo: egresosEfectivo,
+        detallesPagosVentas: salesPayments,
+        detallesPagosCompras: purchasePayments,
+        detallesPagosClientes: clientPayments,
+        isAlreadyClosedToday: false,
       },
-      yaExisteCierre: existingClosing.length > 0,
     })
   } catch (error) {
-    console.error("Error al obtener resumen de ventas:", error)
-    res.status(500).json({ message: "Error al obtener resumen de ventas" })
+    console.error("Error al obtener datos para cierre de caja:", error)
+    res.status(500).json({ message: "Error al obtener datos para cierre de caja" })
+  } finally {
+    connection.release()
   }
 }
 
-// Crear un nuevo cierre de caja
+// Realizar un cierre de caja
 export const createCashClosing = async (req, res) => {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
@@ -75,195 +112,167 @@ export const createCashClosing = async (req, res) => {
   try {
     await connection.beginTransaction()
 
-    const { fechaCierre, efectivoEnCaja, observaciones = null } = req.body
+    const { saldoInicialCaja, fechaCierre, horaCierre, observaciones, detalles, tipoCierre } = req.body
+    const userId = req.user.id
+    const fechaHoraCierre = `${fechaCierre} ${horaCierre}`
 
-    const targetDate = fechaCierre || new Date().toISOString().split("T")[0]
+    // Calcular totales de ingresos y egresos en efectivo de los detalles
+    let totalIngresosEfectivo = 0
+    let totalEgresosEfectivo = 0
+    let totalVentas = 0
+    let totalCompras = 0
 
-    // Verificar si ya existe un cierre para esta fecha
-    const [existingClosing] = await connection.query(
-      `
-      SELECT id FROM cierres_caja 
-      WHERE DATE(fecha_cierre) = ?
-    `,
-      [targetDate],
-    )
+    detalles.forEach((d) => {
+      if (
+        d.tipo_movimiento === "venta" ||
+        d.tipo_movimiento === "pago_cliente" ||
+        d.tipo_movimiento === "ajuste_ingreso"
+      ) {
+        totalVentas += d.monto
+        if (d.metodo_pago === "efectivo") {
+          totalIngresosEfectivo += d.monto
+        }
+      } else if (d.tipo_movimiento === "compra" || d.tipo_movimiento === "ajuste_egreso") {
+        totalCompras += d.monto
+        if (d.metodo_pago === "efectivo") {
+          totalEgresosEfectivo += d.monto
+        }
+      }
+    })
 
-    if (existingClosing.length > 0) {
-      await connection.rollback()
-      return res.status(400).json({
-        message: "Ya existe un cierre de caja para esta fecha",
-      })
-    }
+    // Calcular saldo final y diferencia
+    const saldoFinalCaja = saldoInicialCaja + totalIngresosEfectivo - totalEgresosEfectivo
+    const diferencia = saldoFinalCaja - (saldoInicialCaja + totalIngresosEfectivo - totalEgresosEfectivo) // Debería ser 0 si todo cuadra
 
-    // Obtener resumen de ventas del día
-    const [salesSummary] = await connection.query(
-      `
-      SELECT 
-        COUNT(*) as total_ventas,
-        SUM(total) as monto_total,
-        SUM(descuento) as descuentos_total,
-        SUM(subtotal) as subtotal_total
-      FROM ventas 
-      WHERE DATE(fecha_venta) = ? AND estado = 'completada'
-    `,
-      [targetDate],
-    )
-
-    const summary = salesSummary[0] || {
-      total_ventas: 0,
-      monto_total: 0,
-      descuentos_total: 0,
-      subtotal_total: 0,
-    }
-
-    // Obtener ventas por método de pago
-    const [salesByPayment] = await connection.query(
-      `
-      SELECT 
-        tipo_pago,
-        COUNT(*) as cantidad_ventas,
-        SUM(total) as total_monto
-      FROM ventas 
-      WHERE DATE(fecha_venta) = ? AND estado = 'completada'
-      GROUP BY tipo_pago
-    `,
-      [targetDate],
-    )
-
-    // Calcular efectivo esperado (solo ventas en efectivo)
-    const efectivoEsperado = salesByPayment
-      .filter((item) => item.tipo_pago === "efectivo")
-      .reduce((sum, item) => sum + Number.parseFloat(item.total_monto || 0), 0)
-
-    const diferencia = Number.parseFloat(efectivoEnCaja) - efectivoEsperado
-
-    // Crear el cierre de caja
-    const [result] = await connection.query(
+    const [cierreResult] = await connection.query(
       `
       INSERT INTO cierres_caja (
-        fecha_cierre, usuario_id, total_ventas, monto_total_ventas,
-        efectivo_esperado, efectivo_en_caja, diferencia,
-        observaciones, detalles_ventas
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        usuario_id, fecha_hora_cierre, saldo_inicial_caja, saldo_final_caja,
+        total_ventas, total_compras, total_ingresos_efectivo, total_egresos_efectivo,
+        diferencia, observaciones, tipo_cierre
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
       [
-        targetDate,
-        req.user.id,
-        summary.total_ventas,
-        summary.monto_total,
-        efectivoEsperado,
-        efectivoEnCaja,
+        userId,
+        fechaHoraCierre,
+        saldoInicialCaja,
+        saldoFinalCaja,
+        totalVentas,
+        totalCompras,
+        totalIngresosEfectivo,
+        totalEgresosEfectivo,
         diferencia,
         observaciones,
-        JSON.stringify(salesByPayment),
+        tipoCierre,
       ],
     )
+
+    const cierreId = cierreResult.insertId
+
+    for (const detalle of detalles) {
+      await connection.query(
+        `
+        INSERT INTO cierres_caja_detalles (
+          cierre_id, tipo_movimiento, metodo_pago, monto, cantidad_transacciones, descripcion
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `,
+        [
+          cierreId,
+          detalle.tipo_movimiento,
+          detalle.metodo_pago,
+          detalle.monto,
+          detalle.cantidad_transacciones || 1,
+          detalle.descripcion || null,
+        ],
+      )
+    }
+
+    // Actualizar la última fecha y hora de cierre en la configuración
+    await updateLastCashClosingDateTime(connection, fechaHoraCierre)
 
     await connection.commit()
 
     res.status(201).json({
-      message: "Cierre de caja creado exitosamente",
-      id: result.insertId,
-      diferencia: diferencia,
+      success: true,
+      message: "Cierre de caja realizado exitosamente",
+      data: { id: cierreId, fechaHoraCierre, saldoFinalCaja },
     })
   } catch (error) {
     await connection.rollback()
     console.error("Error al crear cierre de caja:", error)
-    res.status(500).json({ message: "Error al crear cierre de caja" })
+    res.status(500).json({ message: error.message || "Error al crear cierre de caja" })
   } finally {
     connection.release()
   }
 }
 
-// Obtener todos los cierres de caja con filtros
+// Obtener historial de cierres de caja
 export const getCashClosings = async (req, res) => {
   try {
-    const { fechaInicio = "", fechaFin = "", usuario = "", sortBy = "fecha_cierre", sortOrder = "desc" } = req.query
+    const { fechaInicio = "", fechaFin = "", usuarioId = "", tipoCierre = "", limit = 10, offset = 0 } = req.query
 
     let query = `
-      SELECT 
-        cc.id,
-        cc.fecha_cierre,
-        cc.total_ventas,
-        cc.monto_total_ventas,
-        cc.efectivo_esperado,
-        cc.efectivo_en_caja,
-        cc.diferencia,
-        cc.observaciones,
-        cc.fecha_creacion,
+      SELECT
+        cc.*,
         u.nombre as usuario_nombre
       FROM cierres_caja cc
-      LEFT JOIN usuarios u ON cc.usuario_id = u.id
+      JOIN usuarios u ON cc.usuario_id = u.id
       WHERE 1=1
     `
-
     const queryParams = []
 
-    // Filtros
     if (fechaInicio) {
-      query += ` AND DATE(cc.fecha_cierre) >= ?`
+      query += ` AND DATE(cc.fecha_hora_cierre) >= ?`
       queryParams.push(fechaInicio)
     }
-
     if (fechaFin) {
-      query += ` AND DATE(cc.fecha_cierre) <= ?`
+      query += ` AND DATE(cc.fecha_hora_cierre) <= ?`
       queryParams.push(fechaFin)
     }
-
-    if (usuario) {
-      query += ` AND u.nombre LIKE ?`
-      queryParams.push(`%${usuario}%`)
+    if (usuarioId) {
+      query += ` AND cc.usuario_id = ?`
+      queryParams.push(usuarioId)
+    }
+    if (tipoCierre) {
+      query += ` AND cc.tipo_cierre = ?`
+      queryParams.push(tipoCierre)
     }
 
-    // Ordenamiento
-    const validSortFields = ["fecha_cierre", "monto_total_ventas", "diferencia", "usuario_nombre"]
-    const validSortOrders = ["asc", "desc"]
-
-    if (validSortFields.includes(sortBy) && validSortOrders.includes(sortOrder)) {
-      if (sortBy === "usuario_nombre") {
-        query += ` ORDER BY u.nombre ${sortOrder}`
-      } else {
-        query += ` ORDER BY cc.${sortBy} ${sortOrder}`
-      }
-    }
+    query += ` ORDER BY cc.fecha_hora_cierre DESC LIMIT ? OFFSET ?`
+    queryParams.push(Number.parseInt(limit), Number.parseInt(offset))
 
     const [closings] = await pool.query(query, queryParams)
 
-    // Convertir fechas a ISO
-    const closingsWithDates = closings.map((closing) => ({
-      ...closing,
-      fecha_cierre: closing.fecha_cierre.toISOString(),
-      fecha_creacion: closing.fecha_creacion.toISOString(),
+    const formattedClosings = closings.map((c) => ({
+      ...c,
+      fecha_cierre: c.fecha_hora_cierre.toISOString().split("T")[0],
+      hora_cierre: c.fecha_hora_cierre.toISOString().split("T")[1].substring(0, 5), // HH:MM
+      fecha_creacion: c.fecha_creacion.toISOString(),
+      fecha_actualizacion: c.fecha_actualizacion.toISOString(),
     }))
 
-    res.status(200).json(closingsWithDates)
+    res.status(200).json({
+      success: true,
+      data: formattedClosings,
+    })
   } catch (error) {
     console.error("Error al obtener cierres de caja:", error)
-    res.status(500).json({ message: "Error al obtener cierres de caja" })
+    res.status(500).json({ message: "Error al obtener historial de cierres de caja" })
   }
 }
 
-// Obtener un cierre de caja por ID
+// Obtener detalles de un cierre de caja por ID
 export const getCashClosingById = async (req, res) => {
   try {
     const { id } = req.params
 
     const [closings] = await pool.query(
       `
-      SELECT 
-        cc.id,
-        cc.fecha_cierre,
-        cc.total_ventas,
-        cc.monto_total_ventas,
-        cc.efectivo_esperado,
-        cc.efectivo_en_caja,
-        cc.diferencia,
-        cc.observaciones,
-        cc.detalles_ventas,
-        cc.fecha_creacion,
+      SELECT
+        cc.*,
         u.nombre as usuario_nombre
       FROM cierres_caja cc
-      LEFT JOIN usuarios u ON cc.usuario_id = u.id
+      JOIN usuarios u ON cc.usuario_id = u.id
       WHERE cc.id = ?
     `,
       [id],
@@ -275,73 +284,34 @@ export const getCashClosingById = async (req, res) => {
 
     const closing = closings[0]
 
-    // Parsear detalles de ventas
-    if (closing.detalles_ventas) {
-      try {
-        closing.detalles_ventas = JSON.parse(closing.detalles_ventas)
-      } catch (e) {
-        closing.detalles_ventas = []
-      }
-    }
-
-    // Convertir fechas
-    closing.fecha_cierre = closing.fecha_cierre.toISOString()
-    closing.fecha_creacion = closing.fecha_creacion.toISOString()
-
-    res.status(200).json(closing)
-  } catch (error) {
-    console.error("Error al obtener cierre de caja:", error)
-    res.status(500).json({ message: "Error al obtener cierre de caja" })
-  }
-}
-
-// Obtener estadísticas de cierres de caja
-export const getCashClosingStats = async (req, res) => {
-  try {
-    const { fechaInicio = "", fechaFin = "" } = req.query
-
-    let dateFilter = ""
-    const queryParams = []
-
-    if (fechaInicio && fechaFin) {
-      dateFilter = "WHERE DATE(fecha_cierre) BETWEEN ? AND ?"
-      queryParams.push(fechaInicio, fechaFin)
-    } else if (fechaInicio) {
-      dateFilter = "WHERE DATE(fecha_cierre) >= ?"
-      queryParams.push(fechaInicio)
-    } else if (fechaFin) {
-      dateFilter = "WHERE DATE(fecha_cierre) <= ?"
-      queryParams.push(fechaFin)
-    }
-
-    // Estadísticas generales
-    const [stats] = await pool.query(
+    const [details] = await pool.query(
       `
-      SELECT 
-        COUNT(*) as total_cierres,
-        SUM(monto_total_ventas) as monto_total,
-        AVG(monto_total_ventas) as promedio_ventas,
-        SUM(ABS(diferencia)) as total_diferencias,
-        SUM(CASE WHEN diferencia > 0 THEN diferencia ELSE 0 END) as sobrantes_total,
-        SUM(CASE WHEN diferencia < 0 THEN ABS(diferencia) ELSE 0 END) as faltantes_total
-      FROM cierres_caja 
-      ${dateFilter}
+      SELECT *
+      FROM cierres_caja_detalles
+      WHERE cierre_id = ?
+      ORDER BY tipo_movimiento, metodo_pago
     `,
-      queryParams,
+      [id],
     )
 
-    res.status(200).json(
-      stats[0] || {
-        total_cierres: 0,
-        monto_total: 0,
-        promedio_ventas: 0,
-        total_diferencias: 0,
-        sobrantes_total: 0,
-        faltantes_total: 0,
-      },
-    )
+    const formattedClosing = {
+      ...closing,
+      fecha_cierre: closing.fecha_hora_cierre.toISOString().split("T")[0],
+      hora_cierre: closing.fecha_hora_cierre.toISOString().split("T")[1].substring(0, 5), // HH:MM
+      fecha_creacion: closing.fecha_creacion.toISOString(),
+      fecha_actualizacion: closing.fecha_actualizacion.toISOString(),
+      detalles: details.map((d) => ({
+        ...d,
+        fecha_creacion: d.fecha_creacion.toISOString(),
+      })),
+    }
+
+    res.status(200).json({
+      success: true,
+      data: formattedClosing,
+    })
   } catch (error) {
-    console.error("Error al obtener estadísticas:", error)
-    res.status(500).json({ message: "Error al obtener estadísticas" })
+    console.error("Error al obtener cierre de caja por ID:", error)
+    res.status(500).json({ message: "Error al obtener detalles del cierre de caja" })
   }
 }

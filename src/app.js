@@ -16,7 +16,7 @@ import clientsRoutes from "./routes/clients.routes.js"
 import salesRoutes from "./routes/sales.routes.js"
 import cashClosingRoutes from "./routes/cashClosing.routes.js"
 import cuentaCorrienteRoutes from "./routes/cuentaCorriente.routes.js" // NUEVO
-
+import dashboardRoutes from "./routes/dashboard.routes.js"
 const app = express()
 
 const allowedOrigins = [
@@ -37,7 +37,7 @@ const corsOptions = {
       callback(new Error("No permitido por CORS"))
     }
   },
-  methods: ["POST", "PUT", "DELETE", "GET", "OPTIONS"],
+  methods: ["POST", "PUT", "DELETE", "GET", "OPTIONS", "PATCH"],
   credentials: true,
 }
 
@@ -58,6 +58,7 @@ app.use("/api/clientes", clientsRoutes)
 app.use("/api/sales", salesRoutes)
 app.use("/api/cash-closing", cashClosingRoutes)
 app.use("/api/cuenta-corriente", cuentaCorrienteRoutes) // NUEVA RUTA
+app.use("/api/dashboard", dashboardRoutes) // NUEVA RUTA
 
 // Middleware para manejar errores
 app.use((err, req, res, next) => {

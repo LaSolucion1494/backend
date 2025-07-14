@@ -1,195 +1,94 @@
 import pool from "../db.js"
 import { validationResult } from "express-validator"
+// Add imports for pricing utilities
+import { getPricingConfig, calculateSalePrice } from "../lib/pricing.js"
+
+// Función para obtener datos de la empresa desde la configuración
+const getCompanyDataFromConfig = async (connection) => {
+  try {
+    const [config] = await connection.query(`
+    SELECT clave, valor FROM configuracion 
+    WHERE clave IN (
+      'empresa_nombre', 'empresa_telefono', 'empresa_direccion', 'empresa_cuit', 
+      'empresa_email', 'empresa_condicion_iva', 'empresa_inicio_actividades'
+    )
+  `)
+
+    const configObj = {}
+    config.forEach((item) => {
+      configObj[item.clave] = item.valor || ""
+    })
+
+    return {
+      nombre: configObj.empresa_nombre || "La Solución Repuestos",
+      telefono: configObj.empresa_telefono || "",
+      direccion: configObj.empresa_direccion || "",
+      cuit: configObj.empresa_cuit || "",
+      email: configObj.empresa_email || "",
+      condicion_iva: "RESPONSABLE INSCRIPTO",
+      inicio_actividades: "01/05/1998",
+    }
+  } catch (error) {
+    console.error("Error al obtener datos de la empresa:", error)
+    return {
+      nombre: "La Solución Repuestos",
+      telefono: "",
+      direccion: "",
+      cuit: "",
+      email: "",
+      condicion_iva: "RESPONSABLE INSCRIPTO",
+      inicio_actividades: "01/05/1998",
+    }
+  }
+}
 
 // Función para generar el próximo número de compra
 const generatePurchaseNumber = async (connection) => {
   try {
-    // Obtener configuración de numeración
     const [config] = await connection.query(`
-      SELECT clave, valor FROM configuracion 
-      WHERE clave IN ('compra_numero_siguiente', 'compra_prefijo')
-    `)
+    SELECT clave, valor FROM configuracion 
+    WHERE clave IN ('compra_numero_siguiente', 'compra_prefijo')
+    FOR UPDATE
+  `)
+
+    if (config.length === 0) {
+      throw new Error("No se encontró configuración de numeración de compras")
+    }
 
     const configObj = {}
     config.forEach((item) => {
       configObj[item.clave] = item.valor
     })
 
-    const nextNumber = Number.parseInt(configObj.compra_numero_siguiente || 1)
+    if (!configObj.compra_numero_siguiente) {
+      throw new Error("No se encontró el próximo número de compra en la configuración")
+    }
+
+    const nextNumber = Number.parseInt(configObj.compra_numero_siguiente)
+    if (isNaN(nextNumber) || nextNumber < 1) {
+      throw new Error(`Número de compra inválido en configuración: ${configObj.compra_numero_siguiente}`)
+    }
+
     const prefix = configObj.compra_prefijo || "COMP-"
     const purchaseNumber = `${prefix}${nextNumber.toString().padStart(6, "0")}`
 
-    // Actualizar el siguiente número
-    await connection.query("UPDATE configuracion SET valor = ? WHERE clave = 'compra_numero_siguiente'", [
-      (nextNumber + 1).toString(),
-    ])
+    const [updateResult] = await connection.query(
+      "UPDATE configuracion SET valor = ? WHERE clave = 'compra_numero_siguiente'",
+      [(nextNumber + 1).toString()],
+    )
+
+    if (updateResult.affectedRows === 0) {
+      throw new Error("No se pudo actualizar el contador de compras")
+    }
 
     return purchaseNumber
   } catch (error) {
     console.error("Error al generar número de compra:", error)
-    throw error
+    throw new Error(`Error al generar número de compra: ${error.message}`)
   }
 }
 
-// Obtener todas las compras con filtros
-export const getPurchases = async (req, res) => {
-  try {
-    const { proveedor = "", estado = "", fechaInicio = "", fechaFin = "", limit = 50, offset = 0 } = req.query
-
-    let query = `
-      SELECT 
-        c.id,
-        c.numero_compra,
-        c.fecha_compra,
-        c.subtotal,
-        c.descuento,
-        c.interes,
-        c.total,
-        c.estado,
-        c.observaciones,
-        c.fecha_creacion,
-        p.nombre as proveedor_nombre,
-        u.nombre as usuario_nombre,
-        COUNT(dc.id) as total_items
-      FROM compras c
-      JOIN proveedores p ON c.proveedor_id = p.id
-      JOIN usuarios u ON c.usuario_id = u.id
-      LEFT JOIN detalles_compras dc ON c.id = dc.compra_id
-      WHERE 1=1
-    `
-
-    const queryParams = []
-
-    // Filtros
-    if (proveedor) {
-      query += ` AND p.nombre LIKE ?`
-      queryParams.push(`%${proveedor}%`)
-    }
-
-    if (estado) {
-      query += ` AND c.estado = ?`
-      queryParams.push(estado)
-    }
-
-    if (fechaInicio) {
-      query += ` AND DATE(c.fecha_compra) >= ?`
-      queryParams.push(fechaInicio)
-    }
-
-    if (fechaFin) {
-      query += ` AND DATE(c.fecha_compra) <= ?`
-      queryParams.push(fechaFin)
-    }
-
-    query += ` GROUP BY c.id ORDER BY c.fecha_compra DESC, c.id DESC LIMIT ? OFFSET ?`
-    queryParams.push(Number.parseInt(limit), Number.parseInt(offset))
-
-    const [purchases] = await pool.query(query, queryParams)
-
-    // Convertir fechas a ISO
-    const purchasesWithISODate = purchases.map((purchase) => ({
-      ...purchase,
-      fecha_compra: purchase.fecha_compra.toISOString().split("T")[0],
-      fecha_creacion: purchase.fecha_creacion.toISOString(),
-    }))
-
-    res.status(200).json(purchasesWithISODate)
-  } catch (error) {
-    console.error("Error al obtener compras:", error)
-    res.status(500).json({ message: "Error al obtener compras" })
-  }
-}
-
-// Obtener una compra por ID con sus detalles
-export const getPurchaseById = async (req, res) => {
-  try {
-    const { id } = req.params
-
-    // Obtener datos principales de la compra
-    const [purchases] = await pool.query(
-      `
-      SELECT 
-        c.id,
-        c.numero_compra,
-        c.proveedor_id,
-        c.fecha_compra,
-        c.subtotal,
-        c.descuento,
-        c.interes,
-        c.total,
-        c.estado,
-        c.observaciones,
-        c.fecha_creacion,
-        p.nombre as proveedor_nombre,
-        u.nombre as usuario_nombre
-      FROM compras c
-      JOIN proveedores p ON c.proveedor_id = p.id
-      JOIN usuarios u ON c.usuario_id = u.id
-      WHERE c.id = ?
-    `,
-      [id],
-    )
-
-    if (purchases.length === 0) {
-      return res.status(404).json({ message: "Compra no encontrada" })
-    }
-
-    // Obtener detalles de la compra
-    const [details] = await pool.query(
-      `
-      SELECT 
-        dc.id,
-        dc.producto_id,
-        dc.cantidad,
-        dc.precio_unitario,
-        dc.subtotal,
-        dc.cantidad_recibida,
-        p.codigo as producto_codigo,
-        p.nombre as producto_nombre,
-        p.marca as producto_marca
-      FROM detalles_compras dc
-      JOIN productos p ON dc.producto_id = p.id
-      WHERE dc.compra_id = ?
-      ORDER BY dc.id
-    `,
-      [id],
-    )
-
-    // Obtener métodos de pago de la compra
-    const [payments] = await pool.query(
-      `
-      SELECT 
-        cp.id,
-        cp.tipo_pago,
-        cp.monto,
-        cp.descripcion,
-        cp.fecha_creacion
-      FROM compra_pagos cp
-      WHERE cp.compra_id = ? 
-      ORDER BY cp.id
-    `,
-      [id],
-    )
-
-    const purchase = {
-      ...purchases[0],
-      fecha_compra: purchases[0].fecha_compra.toISOString().split("T")[0],
-      fecha_creacion: purchases[0].fecha_creacion.toISOString(),
-      detalles: details,
-      pagos: payments.map((payment) => ({
-        ...payment,
-        fecha_creacion: payment.fecha_creacion.toISOString(),
-      })),
-    }
-
-    res.status(200).json(purchase)
-  } catch (error) {
-    console.error("Error al obtener compra:", error)
-    res.status(500).json({ message: "Error al obtener compra" })
-  }
-}
-
-// CORREGIDO: Crear una nueva compra con cálculo correcto de totales
+// Crear una nueva compra
 export const createPurchase = async (req, res) => {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
@@ -203,155 +102,114 @@ export const createPurchase = async (req, res) => {
 
     const {
       proveedorId,
-      fechaCompra,
+      productos,
       descuento = 0,
-      interes = 0, // NUEVO: Campo para interés
+      interes = 0,
       observaciones = "",
-      detalles,
-      recibirInmediatamente = false,
       pagos = [],
+      fechaCompra,
+      recibirInmediatamente = false,
     } = req.body
 
-    // Validar que hay detalles
-    if (!detalles || detalles.length === 0) {
+    if (!productos || productos.length === 0) {
       await connection.rollback()
-      return res.status(400).json({ message: "La compra debe tener al menos un producto" })
+      return res.status(400).json({ message: "Debe incluir al menos un producto" })
     }
 
-    // Validar que hay al menos un método de pago
     if (!pagos || pagos.length === 0) {
       await connection.rollback()
       return res.status(400).json({ message: "Debe incluir al menos un método de pago" })
     }
 
-    // Validar que el proveedor existe
-    const [supplier] = await connection.query("SELECT id FROM proveedores WHERE id = ? AND activo = TRUE", [
-      proveedorId,
-    ])
-    if (supplier.length === 0) {
+    const [proveedorData] = await connection.query(
+      "SELECT id, nombre FROM proveedores WHERE id = ? AND activo = TRUE",
+      [proveedorId],
+    )
+
+    if (proveedorData.length === 0) {
       await connection.rollback()
-      return res.status(400).json({ message: "Proveedor no encontrado" })
+      return res.status(404).json({ message: "Proveedor no encontrado" })
     }
 
-    // CORREGIDO: Calcular totales correctamente
     let subtotal = 0
-    for (const detalle of detalles) {
-      const itemSubtotal = detalle.cantidad * detalle.precioUnitario
-      subtotal += itemSubtotal
+    const productosValidados = []
+
+    for (const item of productos) {
+      const [producto] = await connection.query(
+        "SELECT id, nombre, precio_costo, precio_venta FROM productos WHERE id = ? AND activo = TRUE",
+        [item.productoId],
+      )
+
+      if (producto.length === 0) {
+        await connection.rollback()
+        return res.status(404).json({ message: `Producto con ID ${item.productoId} no encontrado` })
+      }
+
+      const prod = producto[0]
+      const precioUnitario = Number.parseFloat(item.precioUnitario || prod.precio_costo)
+      const cantidad = Number.parseInt(item.cantidad)
+      const subtotalItem = precioUnitario * cantidad
+
+      // Check if the provided price is different from the current cost price in DB
+      if (precioUnitario !== Number.parseFloat(prod.precio_costo)) {
+        // Update product's cost price in DB
+        await connection.query("UPDATE productos SET precio_costo = ? WHERE id = ?", [precioUnitario, item.productoId])
+
+        // Recalculate and update product's sale price
+        const pricingConfig = await getPricingConfig(connection)
+        const newSalePrice = calculateSalePrice(precioUnitario, pricingConfig)
+        await connection.query("UPDATE productos SET precio_venta = ? WHERE id = ?", [newSalePrice, item.productoId])
+      }
+
+      productosValidados.push({
+        ...item,
+        nombre: prod.nombre,
+        precioUnitario,
+        cantidad,
+        subtotalItem,
+      })
+
+      subtotal += subtotalItem
     }
 
-    // Calcular el total final incluyendo descuento e interés
-    const descuentoAmount = Number.parseFloat(descuento || 0)
-    const interesAmount = Number.parseFloat(interes || 0)
-    const totalFinal = subtotal - descuentoAmount + interesAmount
+    const descuentoNum = Number.parseFloat(descuento)
+    const interesNum = Number.parseFloat(interes)
+    const total = subtotal - descuentoNum + interesNum
 
-    // CORREGIDO: Validar que el total de pagos coincida con el total final
     const totalPagos = pagos.reduce((sum, pago) => sum + Number.parseFloat(pago.monto), 0)
-
-    // Usamos una tolerancia de 0.01 para evitar problemas de redondeo
-    if (Math.abs(totalPagos - totalFinal) > 0.01) {
+    if (Math.abs(totalPagos - total) > 0.01) {
       await connection.rollback()
       return res.status(400).json({
-        message: `El total de pagos ($${totalPagos.toFixed(2)}) no coincide con el total de la compra ($${totalFinal.toFixed(2)})`,
-        debug: {
-          subtotal: subtotal,
-          descuento: descuentoAmount,
-          interes: interesAmount,
-          totalCalculado: totalFinal,
-          totalPagos: totalPagos,
-          diferencia: Math.abs(totalPagos - totalFinal),
-        },
+        message: `El total de pagos ($${totalPagos.toFixed(2)}) no coincide con el total de la compra ($${total.toFixed(2)})`,
       })
     }
 
-    // Determinar estado inicial basado en si se recibe inmediatamente
-    const estadoInicial = recibirInmediatamente ? "recibida" : "pendiente"
-
-    // Generar número de compra
     const numeroCompra = await generatePurchaseNumber(connection)
 
-    // CORREGIDO: Insertar compra con interés
-    const [purchaseResult] = await connection.query(
-      `
-      INSERT INTO compras (
-        numero_compra, proveedor_id, usuario_id, fecha_compra, 
-        subtotal, descuento, interes, total, estado, observaciones
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
-      [
-        numeroCompra,
-        proveedorId,
-        req.user.id,
-        fechaCompra,
-        subtotal,
-        descuentoAmount,
-        interesAmount,
-        totalFinal,
-        estadoInicial,
-        observaciones,
-      ],
-    )
-
-    const compraId = purchaseResult.insertId
-
-    // Insertar detalles y manejar stock si se recibe inmediatamente
-    for (const detalle of detalles) {
-      const { productoId, cantidad, precioUnitario } = detalle
-      const itemSubtotal = cantidad * precioUnitario
-
-      // Validar que el producto existe
-      const [product] = await connection.query("SELECT id, stock FROM productos WHERE id = ? AND activo = TRUE", [
-        productoId,
-      ])
-      if (product.length === 0) {
-        await connection.rollback()
-        return res.status(400).json({
-          message: `Producto con ID ${productoId} no encontrado`,
-        })
-      }
-
-      // Determinar cantidad recibida
-      const cantidadRecibida = recibirInmediatamente ? cantidad : 0
-
-      // Insertar detalle de compra
-      await connection.query(
-        `
-        INSERT INTO detalles_compras (
-          compra_id, producto_id, cantidad, precio_unitario, subtotal, cantidad_recibida
-        ) VALUES (?, ?, ?, ?, ?, ?)
-      `,
-        [compraId, productoId, cantidad, precioUnitario, itemSubtotal, cantidadRecibida],
-      )
-
-      // Si se recibe inmediatamente, actualizar stock y crear movimiento
-      if (recibirInmediatamente) {
-        const stockAnterior = product[0].stock
-        const nuevoStock = stockAnterior + cantidad
-
-        // Actualizar stock del producto
-        await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [nuevoStock, productoId])
-
-        // Crear movimiento de stock
-        await connection.query(
-          `
-          INSERT INTO movimientos_stock (
-            producto_id, usuario_id, tipo, cantidad, 
-            stock_anterior, stock_nuevo, motivo
-          ) VALUES (?, ?, 'entrada', ?, ?, ?, ?)
-        `,
-          [
-            productoId,
-            req.user.id,
-            cantidad,
-            stockAnterior,
-            nuevoStock,
-            `Compra recibida inmediatamente - ${numeroCompra}`,
-          ],
-        )
-      }
+    if (!numeroCompra) {
+      await connection.rollback()
+      return res.status(500).json({ message: "Error al generar número de compra" })
     }
 
-    // Insertar métodos de pago
+    const [compraResult] = await connection.query(
+      `
+    INSERT INTO compras (
+      numero_compra, proveedor_id, usuario_id, fecha_compra,
+      subtotal, descuento, interes, total, observaciones
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `,
+      [numeroCompra, proveedorId, req.user.id, fechaCompra, subtotal, descuentoNum, interesNum, total, observaciones],
+    )
+
+    const compraId = compraResult.insertId
+
+    for (const item of productosValidados) {
+      await connection.query(
+        "INSERT INTO detalles_compras (compra_id, producto_id, cantidad, precio_unitario, subtotal) VALUES (?, ?, ?, ?, ?)",
+        [compraId, item.productoId, item.cantidad, item.precioUnitario, item.subtotalItem],
+      )
+    }
+
     for (const pago of pagos) {
       await connection.query(
         "INSERT INTO compra_pagos (compra_id, tipo_pago, monto, descripcion) VALUES (?, ?, ?, ?)",
@@ -359,216 +217,258 @@ export const createPurchase = async (req, res) => {
       )
     }
 
+    if (recibirInmediatamente) {
+      for (const item of productosValidados) {
+        const [stockActual] = await connection.query("SELECT stock FROM productos WHERE id = ?", [item.productoId])
+        const nuevoStock = stockActual[0].stock + item.cantidad
+
+        await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [nuevoStock, item.productoId])
+
+        await connection.query(
+          `
+              INSERT INTO movimientos_stock (
+                  producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
+              ) VALUES (?, ?, 'entrada', ?, ?, ?, ?)
+              `,
+          [
+            item.productoId,
+            req.user.id,
+            item.cantidad,
+            stockActual[0].stock,
+            nuevoStock,
+            `Recepción inmediata compra ${numeroCompra}`,
+          ],
+        )
+
+        await connection.query(
+          "UPDATE detalles_compras SET cantidad_recibida = ? WHERE compra_id = ? AND producto_id = ?",
+          [item.cantidad, compraId, item.productoId],
+        )
+      }
+      await connection.query("UPDATE compras SET estado = 'recibida' WHERE id = ?", [compraId])
+    }
+
     await connection.commit()
 
     res.status(201).json({
-      message: recibirInmediatamente
-        ? "Compra creada y productos recibidos exitosamente"
-        : "Compra creada exitosamente",
-      id: compraId,
-      numeroCompra,
-      estado: estadoInicial,
-      totales: {
-        subtotal,
-        descuento: descuentoAmount,
-        interes: interesAmount,
-        total: totalFinal,
+      message: "Compra creada exitosamente",
+      data: {
+        id: compraId,
+        numeroCompra: numeroCompra,
+        total,
       },
     })
   } catch (error) {
     await connection.rollback()
     console.error("Error al crear compra:", error)
     res.status(500).json({
-      message: "Error al crear compra",
-      error: error.message,
+      message: error.message || "Error al crear compra",
+      details: error.stack,
     })
   } finally {
     connection.release()
   }
 }
 
-// Resto de funciones sin cambios...
-export const updatePurchaseStatus = async (req, res) => {
-  const errors = validationResult(req)
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() })
-  }
-
+// Obtener una compra por ID
+export const getPurchaseById = async (req, res) => {
   try {
     const { id } = req.params
-    const { estado, observaciones = "" } = req.body
 
-    // Verificar que la compra existe
-    const [existing] = await pool.query("SELECT id, estado FROM compras WHERE id = ?", [id])
-    if (existing.length === 0) {
+    const [purchases] = await pool.query(
+      `
+    SELECT 
+      c.*,
+      COALESCE(p.nombre, 'Sin Proveedor') as proveedor_nombre,
+      p.telefono as proveedor_telefono,
+      p.direccion as proveedor_direccion,
+      p.cuit as proveedor_cuit,
+      u.nombre as usuario_nombre
+    FROM compras c
+    LEFT JOIN proveedores p ON c.proveedor_id = p.id
+    JOIN usuarios u ON c.usuario_id = u.id
+    WHERE c.id = ?
+  `,
+      [id],
+    )
+
+    if (purchases.length === 0) {
       return res.status(404).json({ message: "Compra no encontrada" })
     }
 
-    // Actualizar estado
-    await pool.query("UPDATE compras SET estado = ?, observaciones = ? WHERE id = ?", [estado, observaciones, id])
+    const purchase = purchases[0]
 
-    res.status(200).json({ message: "Estado de compra actualizado exitosamente" })
-  } catch (error) {
-    console.error("Error al actualizar estado de compra:", error)
-    res.status(500).json({ message: "Error al actualizar estado de compra" })
-  }
-}
+    const [details] = await pool.query(
+      `
+    SELECT 
+      dc.*,
+      pr.nombre as producto_nombre,
+      pr.codigo as producto_codigo,
+      pr.marca as producto_marca
+    FROM detalles_compras dc
+    JOIN productos pr ON dc.producto_id = pr.id
+    WHERE dc.compra_id = ?
+    ORDER BY dc.id
+  `,
+      [id],
+    )
 
-export const receivePurchaseItems = async (req, res) => {
-  const errors = validationResult(req)
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() })
-  }
+    const [payments] = await pool.query(
+      `
+    SELECT *
+    FROM compra_pagos
+    WHERE compra_id = ? 
+    ORDER BY id
+`,
+      [id],
+    )
 
-  const connection = await pool.getConnection()
-
-  try {
-    await connection.beginTransaction()
-
-    const { id } = req.params
-    const { detallesRecibidos } = req.body
-
-    // Verificar que la compra existe
-    const [purchase] = await connection.query("SELECT id, estado, numero_compra FROM compras WHERE id = ?", [id])
-    if (purchase.length === 0) {
-      await connection.rollback()
-      return res.status(404).json({ message: "Compra no encontrada" })
+    const purchaseData = {
+      ...purchase,
+      fecha_compra: purchase.fecha_compra.toISOString().split("T")[0],
+      fecha_creacion: purchase.fecha_creacion.toISOString(),
+      fecha_actualizacion: purchase.fecha_actualizacion.toISOString(),
+      detalles: details.map((detail) => ({
+        ...detail,
+        fecha_creacion: detail.fecha_creacion.toISOString(),
+      })),
+      pagos: payments.map((payment) => ({
+        ...payment,
+        fecha_creacion: payment.fecha_creacion.toISOString(),
+      })),
     }
-
-    let allItemsReceived = true
-
-    for (const item of detallesRecibidos) {
-      const { detalleId, cantidadRecibida } = item
-
-      // Obtener detalle actual
-      const [detail] = await connection.query(
-        `
-        SELECT dc.*, p.stock 
-        FROM detalles_compras dc
-        JOIN productos p ON dc.producto_id = p.id
-        WHERE dc.id = ? AND dc.compra_id = ?
-      `,
-        [detalleId, id],
-      )
-
-      if (detail.length === 0) {
-        await connection.rollback()
-        return res.status(400).json({
-          message: `Detalle de compra ${detalleId} no encontrado`,
-        })
-      }
-
-      const detalle = detail[0]
-      const nuevaCantidadRecibida = detalle.cantidad_recibida + cantidadRecibida
-
-      // Validar que no se reciba más de lo solicitado
-      if (nuevaCantidadRecibida > detalle.cantidad) {
-        await connection.rollback()
-        return res.status(400).json({
-          message: `No se puede recibir más cantidad de la solicitada para el producto`,
-        })
-      }
-
-      // Actualizar cantidad recibida
-      await connection.query("UPDATE detalles_compras SET cantidad_recibida = ? WHERE id = ?", [
-        nuevaCantidadRecibida,
-        detalleId,
-      ])
-
-      // Actualizar stock del producto
-      const nuevoStock = detalle.stock + cantidadRecibida
-      await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [nuevoStock, detalle.producto_id])
-
-      // Crear movimiento de stock
-      await connection.query(
-        `
-        INSERT INTO movimientos_stock (
-          producto_id, usuario_id, tipo, cantidad, 
-          stock_anterior, stock_nuevo, motivo
-        ) VALUES (?, ?, 'entrada', ?, ?, ?, ?)
-      `,
-        [
-          detalle.producto_id,
-          req.user.id,
-          cantidadRecibida,
-          detalle.stock,
-          nuevoStock,
-          `Recepción de compra ${purchase[0].numero_compra || id}`,
-        ],
-      )
-
-      // Verificar si este item está completamente recibido
-      if (nuevaCantidadRecibida < detalle.cantidad) {
-        allItemsReceived = false
-      }
-    }
-
-    // Actualizar estado de la compra
-    let nuevoEstado = "parcial"
-    if (allItemsReceived) {
-      // Verificar si todos los items de la compra están completamente recibidos
-      const [pendingItems] = await connection.query(
-        `
-        SELECT COUNT(*) as pending 
-        FROM detalles_compras 
-        WHERE compra_id = ? AND cantidad_recibida < cantidad
-      `,
-        [id],
-      )
-
-      if (pendingItems[0].pending === 0) {
-        nuevoEstado = "recibida"
-      }
-    }
-
-    await connection.query("UPDATE compras SET estado = ? WHERE id = ?", [nuevoEstado, id])
-
-    await connection.commit()
 
     res.status(200).json({
-      message: "Productos recibidos exitosamente",
-      nuevoEstado,
+      success: true,
+      data: purchaseData,
     })
   } catch (error) {
-    await connection.rollback()
-    console.error("Error al recibir productos:", error)
-    res.status(500).json({ message: "Error al recibir productos" })
-  } finally {
-    connection.release()
+    console.error("Error al obtener compra:", error)
+    res.status(500).json({ message: "Error al obtener compra" })
   }
 }
 
-export const cancelPurchase = async (req, res) => {
+// Obtener compras para reportes CON PAGINACIÓN
+export const getPurchasesForReports = async (req, res) => {
   try {
-    const { id } = req.params
+    const {
+      fechaInicio = "",
+      fechaFin = "",
+      proveedor = "",
+      numeroCompra = "",
+      estado = "todos",
+      tipoPago = "todos",
+      limit = 10,
+      offset = 0,
+    } = req.query
 
-    // Verificar que la compra existe y no está recibida
-    const [existing] = await pool.query("SELECT id, estado FROM compras WHERE id = ?", [id])
-    if (existing.length === 0) {
-      return res.status(404).json({ message: "Compra no encontrada" })
+    let baseQuery = `
+    FROM compras c
+    LEFT JOIN proveedores p ON c.proveedor_id = p.id
+    JOIN usuarios u ON c.usuario_id = u.id
+    WHERE 1=1
+  `
+
+    const queryParams = []
+
+    if (fechaInicio) {
+      baseQuery += ` AND DATE(c.fecha_compra) >= ?`
+      queryParams.push(fechaInicio)
     }
 
-    if (existing[0].estado === "recibida") {
-      return res.status(400).json({
-        message: "No se puede cancelar una compra que ya fue recibida",
-      })
+    if (fechaFin) {
+      baseQuery += ` AND DATE(c.fecha_compra) <= ?`
+      queryParams.push(fechaFin)
     }
 
-    // Actualizar estado a cancelada
-    await pool.query("UPDATE compras SET estado = 'cancelada' WHERE id = ?", [id])
+    if (proveedor) {
+      baseQuery += ` AND COALESCE(p.nombre, 'Sin Proveedor') LIKE ?`
+      queryParams.push(`%${proveedor}%`)
+    }
 
-    res.status(200).json({ message: "Compra cancelada exitosamente" })
+    if (estado !== "todos") {
+      baseQuery += ` AND c.estado = ?`
+      queryParams.push(estado)
+    }
+
+    if (numeroCompra) {
+      baseQuery += ` AND c.numero_compra LIKE ?`
+      queryParams.push(`%${numeroCompra}%`)
+    }
+
+    if (tipoPago !== "todos") {
+      if (tipoPago === "varios") {
+        baseQuery += ` AND (SELECT COUNT(cp.id) FROM compra_pagos cp WHERE cp.compra_id = c.id) > 1`
+      } else {
+        baseQuery += ` AND EXISTS (SELECT 1 FROM compra_pagos cp WHERE cp.compra_id = c.id AND cp.tipo_pago = ?)`
+        queryParams.push(tipoPago)
+      }
+    }
+
+    // Consulta de conteo
+    const countQuery = `SELECT COUNT(*) as total ${baseQuery}`
+    const [[{ total }]] = await pool.query(countQuery, queryParams)
+
+    // Consulta de datos con paginación
+    const dataQuery = `
+    SELECT 
+      c.id,
+      c.numero_compra,
+      c.fecha_compra,
+      c.subtotal,
+      c.descuento,
+      c.interes,
+      c.total,
+      c.estado,
+      c.observaciones,
+      c.fecha_creacion,
+      COALESCE(p.nombre, 'Sin Proveedor') as proveedor_nombre,
+      u.nombre as usuario_nombre
+    ${baseQuery}
+    ORDER BY c.fecha_compra DESC, c.id DESC
+    LIMIT ? OFFSET ?
+  `
+    const finalDataParams = [...queryParams, Number.parseInt(limit), Number.parseInt(offset)]
+    const [purchases] = await pool.query(dataQuery, finalDataParams)
+
+    // Obtener pagos para cada compra
+    const purchasesWithPayments = await Promise.all(
+      purchases.map(async (purchase) => {
+        const [payments] = await pool.query("SELECT * FROM compra_pagos WHERE compra_id = ?", [purchase.id])
+        return {
+          ...purchase,
+          fecha_compra: purchase.fecha_compra.toISOString().split("T")[0],
+          fecha_creacion: purchase.fecha_creacion.toISOString(),
+          pagos: payments,
+        }
+      }),
+    )
+
+    res.status(200).json({
+      success: true,
+      data: purchasesWithPayments,
+      pagination: {
+        totalItems: total,
+        totalPages: Math.ceil(total / limit),
+        currentPage: Math.floor(offset / limit) + 1,
+        itemsPerPage: Number.parseInt(limit),
+      },
+    })
   } catch (error) {
-    console.error("Error al cancelar compra:", error)
-    res.status(500).json({ message: "Error al cancelar compra" })
+    console.error("Error al obtener compras para reportes:", error)
+    res.status(500).json({
+      success: false,
+      message: "Error al obtener compras para reportes",
+    })
   }
 }
 
-export const getPurchasePaymentStats = async (req, res) => {
+// Obtener estadísticas de compras
+export const getPurchaseStats = async (req, res) => {
   try {
     const { fechaInicio = "", fechaFin = "" } = req.query
 
-    let whereClause = "WHERE c.estado != 'cancelada'"
+    let whereClause = "WHERE 1=1"
     const queryParams = []
 
     if (fechaInicio) {
@@ -581,27 +481,386 @@ export const getPurchasePaymentStats = async (req, res) => {
       queryParams.push(fechaFin)
     }
 
-    // Métodos de pago más utilizados en compras
-    const [metodosPago] = await pool.query(
+    // Estadísticas generales
+    const [generalStats] = await pool.query(
       `
-      SELECT 
-        cp.tipo_pago,
-        COUNT(*) as cantidad_usos,
-        SUM(cp.monto) as total_monto
-      FROM compra_pagos cp
-      JOIN compras c ON cp.compra_id = c.id
-      ${whereClause}
-      GROUP BY cp.tipo_pago
-      ORDER BY total_monto DESC
-    `,
+    SELECT 
+      COUNT(*) as totalCompras,
+      SUM(c.total) as montoTotal,
+      AVG(c.total) as promedioCompra,
+      SUM(CASE WHEN c.estado = 'recibida' THEN 1 ELSE 0 END) as comprasRecibidas,
+      SUM(CASE WHEN c.estado = 'pendiente' THEN 1 ELSE 0 END) as comprasPendientes,
+      SUM(CASE WHEN c.estado = 'parcial' THEN 1 ELSE 0 END) as comprasParciales,
+      SUM(CASE WHEN c.estado = 'cancelada' THEN 1 ELSE 0 END) as comprasCanceladas
+    FROM compras c
+    ${whereClause}
+  `,
       queryParams,
     )
 
+    // Compras por día
+    const [purchasesByDay] = await pool.query(
+      `
+    SELECT 
+      DATE(c.fecha_compra) as fecha,
+      COUNT(*) as cantidad_compras,
+      SUM(c.total) as total_dia
+    FROM compras c
+    ${whereClause}
+    GROUP BY DATE(c.fecha_compra)
+    ORDER BY fecha DESC
+    LIMIT 30
+  `,
+      queryParams,
+    )
+
+    // Top proveedores
+    const [topProviders] = await pool.query(
+      `
+    SELECT 
+      p.id,
+      COALESCE(p.nombre, 'Sin Proveedor') as nombre,
+      COUNT(c.id) as cantidad_compras,
+      SUM(c.total) as total_comprado
+    FROM compras c
+    LEFT JOIN proveedores p ON c.proveedor_id = p.id
+    ${whereClause}
+    GROUP BY p.id, p.nombre
+    ORDER BY total_comprado DESC
+    LIMIT 10
+  `,
+      queryParams,
+    )
+
+    // Métodos de pago
+    const [paymentMethods] = await pool.query(
+      `
+    SELECT 
+      cp.tipo_pago,
+      COUNT(cp.id) as cantidad_usos,
+      SUM(cp.monto) as total_monto
+    FROM compra_pagos cp
+    JOIN compras c ON cp.compra_id = c.id
+    ${whereClause.replace("WHERE", "WHERE")}
+    GROUP BY cp.tipo_pago
+    ORDER BY total_monto DESC
+  `,
+      queryParams,
+    )
+
+    const stats = {
+      ...generalStats[0],
+      compras_por_dia: purchasesByDay.map((day) => ({
+        ...day,
+        fecha: day.fecha.toISOString().split("T")[0],
+      })),
+      top_proveedores: topProviders,
+      metodos_pago: paymentMethods,
+    }
+
     res.status(200).json({
-      metodos_pago: metodosPago,
+      success: true,
+      data: stats,
     })
   } catch (error) {
-    console.error("Error al obtener estadísticas de métodos de pago:", error)
-    res.status(500).json({ message: "Error al obtener estadísticas de métodos de pago" })
+    console.error("Error al obtener estadísticas:", error)
+    res.status(500).json({
+      success: false,
+      message: "Error al obtener estadísticas",
+    })
+  }
+}
+
+// Obtener compras CON PAGINACIÓN
+export const getPurchases = async (req, res) => {
+  try {
+    const { fechaInicio = "", fechaFin = "", proveedor = "", estado = "todos", limit = 10, offset = 0 } = req.query
+
+    let baseQuery = `
+    FROM compras c
+    LEFT JOIN proveedores p ON c.proveedor_id = p.id
+    JOIN usuarios u ON c.usuario_id = u.id
+    WHERE 1=1
+  `
+
+    const queryParams = []
+
+    if (fechaInicio) {
+      baseQuery += ` AND DATE(c.fecha_compra) >= ?`
+      queryParams.push(fechaInicio)
+    }
+
+    if (fechaFin) {
+      baseQuery += ` AND DATE(c.fecha_compra) <= ?`
+      queryParams.push(fechaFin)
+    }
+
+    if (proveedor) {
+      baseQuery += ` AND COALESCE(p.nombre, 'Sin Proveedor') LIKE ?`
+      queryParams.push(`%${proveedor}%`)
+    }
+
+    if (estado !== "todos") {
+      baseQuery += ` AND c.estado = ?`
+      queryParams.push(estado)
+    }
+
+    // Consulta de conteo
+    const countQuery = `SELECT COUNT(*) as total ${baseQuery}`
+    const [[{ total }]] = await pool.query(countQuery, queryParams)
+
+    // Consulta de datos con paginación
+    const dataQuery = `
+    SELECT 
+      c.id,
+      c.numero_compra,
+      c.fecha_compra,
+      c.subtotal,
+      c.descuento,
+      c.interes,
+      c.total,
+      c.estado,
+      c.observaciones,
+      c.fecha_creacion,
+      COALESCE(p.nombre, 'Sin Proveedor') as proveedor_nombre,
+      u.nombre as usuario_nombre
+    ${baseQuery}
+    ORDER BY c.fecha_compra DESC, c.id DESC
+    LIMIT ? OFFSET ?
+  `
+    const finalDataParams = [...queryParams, Number.parseInt(limit), Number.parseInt(offset)]
+    const [purchases] = await pool.query(dataQuery, finalDataParams)
+
+    const purchasesWithISODate = purchases.map((purchase) => ({
+      ...purchase,
+      fecha_compra: purchase.fecha_compra.toISOString().split("T")[0],
+      fecha_creacion: purchase.fecha_creacion.toISOString(),
+    }))
+
+    res.status(200).json({
+      success: true,
+      data: purchasesWithISODate,
+      pagination: {
+        totalItems: total,
+        totalPages: Math.ceil(total / limit),
+        currentPage: Math.floor(offset / limit) + 1,
+        itemsPerPage: Number.parseInt(limit),
+      },
+    })
+  } catch (error) {
+    console.error("Error al obtener compras:", error)
+    res.status(500).json({
+      success: false,
+      message: "Error al obtener compras",
+    })
+  }
+}
+
+// Recibir productos de compra
+export const receivePurchaseItems = async (req, res) => {
+  const connection = await pool.getConnection()
+
+  try {
+    await connection.beginTransaction()
+
+    const { id } = req.params
+    const { detallesRecibidos } = req.body
+
+    const [purchases] = await connection.query("SELECT * FROM compras WHERE id = ?", [id])
+
+    if (purchases.length === 0) {
+      await connection.rollback()
+      return res.status(404).json({ message: "Compra no encontrada" })
+    }
+
+    const purchase = purchases[0]
+
+    if (purchase.estado === "cancelada") {
+      await connection.rollback()
+      return res.status(400).json({ message: "No se pueden recibir productos de una compra cancelada" })
+    }
+
+    for (const detalle of detallesRecibidos) {
+      const [detalleCompra] = await connection.query("SELECT * FROM detalles_compras WHERE id = ? AND compra_id = ?", [
+        detalle.detalleId,
+        id,
+      ])
+
+      if (detalleCompra.length === 0) {
+        await connection.rollback()
+        return res.status(404).json({ message: `Detalle de compra ${detalle.detalleId} no encontrado` })
+      }
+
+      const detalleData = detalleCompra[0]
+      const nuevaCantidadRecibida = detalleData.cantidad_recibida + detalle.cantidadRecibida
+
+      if (nuevaCantidadRecibida > detalleData.cantidad) {
+        await connection.rollback()
+        return res.status(400).json({
+          message: `La cantidad a recibir excede la cantidad pendiente para el producto ${detalleData.producto_id}`,
+        })
+      }
+
+      // Actualizar cantidad recibida
+      await connection.query("UPDATE detalles_compras SET cantidad_recibida = ? WHERE id = ?", [
+        nuevaCantidadRecibida,
+        detalle.detalleId,
+      ])
+
+      // Actualizar stock del producto
+      const [stockActual] = await connection.query("SELECT stock FROM productos WHERE id = ?", [
+        detalleData.producto_id,
+      ])
+      const nuevoStock = stockActual[0].stock + detalle.cantidadRecibida
+
+      await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [nuevoStock, detalleData.producto_id])
+
+      // Registrar movimiento de stock
+      await connection.query(
+        `
+      INSERT INTO movimientos_stock (
+        producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
+      ) VALUES (?, ?, 'entrada', ?, ?, ?, ?)
+    `,
+        [
+          detalleData.producto_id,
+          req.user.id,
+          detalle.cantidadRecibida,
+          stockActual[0].stock,
+          nuevoStock,
+          `Recepción compra ${purchase.numero_compra}`,
+        ],
+      )
+    }
+
+    // Verificar si todos los productos están completamente recibidos
+    const [pendingItems] = await connection.query(
+      "SELECT COUNT(*) as pending FROM detalles_compras WHERE compra_id = ? AND cantidad_recibida < cantidad",
+      [id],
+    )
+
+    let nuevoEstado = purchase.estado
+    if (pendingItems[0].pending === 0) {
+      nuevoEstado = "recibida"
+    } else if (purchase.estado === "pendiente") {
+      nuevoEstado = "parcial"
+    }
+
+    if (nuevoEstado !== purchase.estado) {
+      await connection.query("UPDATE compras SET estado = ? WHERE id = ?", [nuevoEstado, id])
+    }
+
+    await connection.commit()
+
+    res.status(200).json({
+      success: true,
+      message: "Productos recibidos exitosamente",
+      data: {
+        id,
+        estado: nuevoEstado,
+      },
+    })
+  } catch (error) {
+    await connection.rollback()
+    console.error("Error al recibir productos:", error)
+    res.status(500).json({ message: error.message || "Error al recibir productos" })
+  } finally {
+    connection.release()
+  }
+}
+
+// Cancelar compra
+export const cancelPurchase = async (req, res) => {
+  const connection = await pool.getConnection()
+
+  try {
+    await connection.beginTransaction()
+
+    const { id } = req.params
+    const { motivo = "" } = req.body
+
+    const [purchases] = await connection.query("SELECT * FROM compras WHERE id = ? AND estado != 'cancelada'", [id])
+
+    if (purchases.length === 0) {
+      await connection.rollback()
+      return res.status(404).json({ message: "Compra no encontrada o ya está cancelada" })
+    }
+
+    const purchase = purchases[0]
+
+    // If there are products received, revert the stock
+    const [receivedItems] = await connection.query(
+      "SELECT * FROM detalles_compras WHERE compra_id = ? AND cantidad_recibida > 0",
+      [id],
+    )
+
+    for (const item of receivedItems) {
+      const [stockActual] = await connection.query("SELECT stock FROM productos WHERE id = ?", [item.producto_id])
+      const nuevoStock = Math.max(0, stockActual[0].stock - item.cantidad_recibida)
+
+      await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [nuevoStock, item.producto_id])
+
+      await connection.query(
+        `
+      INSERT INTO movimientos_stock (
+        producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
+      ) VALUES (?, ?, 'salida', ?, ?, ?, ?)
+    `,
+        [
+          item.producto_id,
+          req.user.id,
+          item.cantidad_recibida,
+          stockActual[0].stock,
+          nuevoStock,
+          `Cancelación compra ${purchase.numero_compra} - ${motivo}`,
+        ],
+      )
+    }
+
+    await connection.query(
+      "UPDATE compras SET estado = 'cancelada', observaciones = CONCAT(COALESCE(observaciones, ''), ' - CANCELADA: ', ?) WHERE id = ?",
+      [motivo, id],
+    )
+
+    await connection.commit()
+
+    res.status(200).json({
+      success: true,
+      message: "Compra cancelada exitosamente",
+      data: {
+        id,
+        numeroCompra: purchase.numero_compra,
+        motivo,
+      },
+    })
+  } catch (error) {
+    await connection.rollback()
+    console.error("Error al cancelar compra:", error)
+    res.status(500).json({ message: error.message || "Error al cancelar compra" })
+  } finally {
+    connection.release()
+  }
+}
+
+// Actualizar compra
+export const updatePurchase = async (req, res) => {
+  try {
+    const { id } = req.params
+    const { observaciones } = req.body
+
+    const [result] = await pool.query("UPDATE compras SET observaciones = ? WHERE id = ?", [observaciones, id])
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Compra no encontrada" })
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Compra actualizada exitosamente",
+      data: { id, observaciones },
+    })
+  } catch (error) {
+    console.error("Error al actualizar compra:", error)
+    res.status(500).json({ message: "Error al actualizar compra" })
   }
 }

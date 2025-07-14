@@ -1,33 +1,36 @@
 import { Router } from "express"
 import { check } from "express-validator"
 import {
-  getDailySalesSummary,
   createCashClosing,
   getCashClosings,
   getCashClosingById,
-  getCashClosingStats,
+  getPendingCashClosingData,
 } from "../controllers/cashClosing.controller.js"
 import { verifyToken } from "../middlewares/verifyToken.js"
 
 const router = Router()
 
 // Validaciones para crear cierre de caja
-const validateCashClosingSchema = [
-  check("efectivoEnCaja").isFloat({ min: 0 }).withMessage("El efectivo en caja debe ser mayor o igual a 0"),
-  check("fechaCierre").optional().isDate().withMessage("Fecha de cierre inválida"),
-  check("observaciones")
-    .optional()
-    .isLength({ max: 500 })
-    .withMessage("Las observaciones no pueden exceder 500 caracteres"),
+const validateCreateCashClosing = [
+  check("saldoInicialCaja").isFloat({ min: 0 }).withMessage("Saldo inicial de caja inválido"),
+  check("fechaCierre")
+    .matches(/^\d{4}-\d{2}-\d{2}$/)
+    .withMessage("Fecha de cierre debe estar en formato YYYY-MM-DD")
+    .isISO8601()
+    .withMessage("Fecha de cierre inválida"),
+  check("horaCierre")
+    .matches(/^\d{2}:\d{2}$/)
+    .withMessage("Hora de cierre debe estar en formato HH:MM"),
+  check("detalles").isArray({ min: 0 }).withMessage("Los detalles del cierre son requeridos"),
+  check("observaciones").optional().isLength({ max: 500 }).withMessage("Observaciones muy largas"),
 ]
 
-// Rutas que requieren autenticación
-router.get("/daily-summary", verifyToken(), getDailySalesSummary)
-router.get("/stats", verifyToken(), getCashClosingStats)
-router.get("/", verifyToken(), getCashClosings)
-router.get("/:id", verifyToken(), getCashClosingById)
+// Rutas de consulta
+router.get("/pending", verifyToken(), getPendingCashClosingData)
+router.get("/", verifyToken(["admin"]), getCashClosings)
+router.get("/:id", verifyToken(["admin"]), getCashClosingById)
 
-// Rutas que requieren permisos específicos
-router.post("/", verifyToken(["admin", "empleado"]), validateCashClosingSchema, createCashClosing)
+// Rutas de operaciones
+router.post("/", verifyToken(["admin"]), validateCreateCashClosing, createCashClosing)
 
 export default router

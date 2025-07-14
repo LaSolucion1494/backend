@@ -8,7 +8,9 @@ import {
   deleteProduct,
   getProductByCode,
   validateProductCode,
-  getProductPriceBreakdown, // Importado
+  getProductPriceBreakdown,
+  updateProductPrices,
+  searchProducts,
 } from "../controllers/products.controller.js"
 import { verifyToken } from "../middlewares/verifyToken.js"
 
@@ -29,19 +31,33 @@ const validateProductUpdateSchema = [
   check("precioCosto").isFloat({ min: 0 }).withMessage("El precio de costo debe ser un número positivo"),
 ]
 
+// Validaciones para actualización de precios
+const validatePriceUpdateSchema = [
+  check("precio_costo").isFloat({ min: 0 }).withMessage("El precio de costo debe ser un número positivo"),
+  check("precio_venta").optional().isFloat({ min: 0 }).withMessage("El precio de venta debe ser un número positivo"),
+]
+
 // --- Rutas de Productos ---
+// IMPORTANTE: Las rutas específicas deben ir ANTES que las rutas con parámetros
 
-router.get("/", verifyToken(), getProducts)
-router.get("/:id", verifyToken(), getProductById)
+// Ruta de búsqueda (debe ir antes de /:id)
+router.get("/search", verifyToken(), searchProducts)
 
-// Nueva ruta para obtener el desglose de precios de un producto
-router.get("/:id/price-breakdown", verifyToken(), getProductPriceBreakdown)
-
-router.get("/code/:code", verifyToken(), getProductByCode)
+// Ruta de validación de código
 router.post("/validate-code", verifyToken(), validateProductCode)
+
+// Rutas principales
+router.get("/", verifyToken(), getProducts)
 router.post("/", verifyToken(), validateProductSchema, createProduct)
+
+// Rutas con parámetros específicos (deben ir antes de /:id genérico)
+router.get("/code/:code", verifyToken(), getProductByCode)
+
+// Rutas con ID genérico (deben ir al final)
+router.get("/:id", verifyToken(), getProductById)
+router.get("/:id/price-breakdown", verifyToken(), getProductPriceBreakdown)
 router.put("/:id", verifyToken(), validateProductUpdateSchema, updateProduct)
+router.put("/:id/prices", verifyToken(), validatePriceUpdateSchema, updateProductPrices)
 router.delete("/:id", verifyToken(["admin"]), deleteProduct)
 
 export default router
- 

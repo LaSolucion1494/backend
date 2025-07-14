@@ -1,4 +1,4 @@
-// cuentaCorriente.controller.js - CONTROLADOR CON VALORES HARDCODEADOS
+// cuentaCorriente.controller.js - CONTROLADOR CON LÓGICA DE AJUSTES CORREGIDA Y PAGINACIÓN
 import pool from "../db.js"
 import { validationResult } from "express-validator"
 
@@ -83,23 +83,6 @@ export const registrarPago = async (req, res) => {
 
     const cliente = clientData[0]
 
-    // Validar que el cliente tenga saldo pendiente
-    if (cliente.saldo_cuenta_corriente <= 0.01) {
-      await connection.rollback()
-      return res.status(400).json({ message: "El cliente no tiene saldo pendiente para pagar" })
-    }
-
-    // Validar que el monto no sea mayor al saldo actual
-    if (monto > cliente.saldo_cuenta_corriente + 0.01) {
-      await connection.rollback()
-      return res.status(400).json({
-        message: `El monto del pago ($${monto.toFixed(2)}) no puede ser mayor al saldo actual ($${cliente.saldo_cuenta_corriente.toFixed(2)})`,
-      })
-    }
-
-    // Generar número de recibo
-    const numeroRecibo = await generateReceiptNumber(connection)
-
     // Obtener el saldo actual con FOR UPDATE
     const [saldoActualResult] = await connection.query(
       "SELECT saldo_cuenta_corriente FROM clientes WHERE id = ? FOR UPDATE",
@@ -107,7 +90,11 @@ export const registrarPago = async (req, res) => {
     )
 
     const saldoAnterior = saldoActualResult[0].saldo_cuenta_corriente
-    const nuevoSaldo = Math.max(0, saldoAnterior - monto) // Disminuye la deuda
+    // Permitir que el saldo se vuelva negativo (a favor del cliente)
+    const nuevoSaldo = saldoAnterior - monto
+
+    // Generar número de recibo
+    const numeroRecibo = await generateReceiptNumber(connection)
 
     // Actualizar saldo de la cuenta corriente
     await connection.query("UPDATE clientes SET saldo_cuenta_corriente = ROUND(?, 2) WHERE id = ?", [
@@ -151,6 +138,7 @@ export const registrarPago = async (req, res) => {
     await connection.commit()
 
     res.status(201).json({
+      success: true,
       message: "Pago registrado exitosamente",
       data: {
         id: pagoResult.insertId,
@@ -164,13 +152,13 @@ export const registrarPago = async (req, res) => {
   } catch (error) {
     await connection.rollback()
     console.error("Error al registrar pago:", error)
-    res.status(500).json({ message: error.message || "Error al registrar pago" })
+    res.status(500).json({ success: false, message: error.message || "Error al registrar pago" })
   } finally {
     connection.release()
   }
 }
 
-// Obtener historial de pagos de un cliente
+// Obtener historial de pagos de un cliente CON PAGINACIÓN
 export const getPagosByClient = async (req, res) => {
   try {
     const { clientId } = req.params
@@ -183,11 +171,11 @@ export const getPagosByClient = async (req, res) => {
     )
 
     if (client.length === 0) {
-      return res.status(404).json({ message: "Cliente no encontrado" })
+      return res.status(404).json({ success: false, message: "Cliente no encontrado" })
     }
 
     if (!client[0].tiene_cuenta_corriente) {
-      return res.status(400).json({ message: "El cliente no tiene cuenta corriente habilitada" })
+      return res.status(400).json({ success: false, message: "El cliente no tiene cuenta corriente habilitada" })
     }
 
     let whereClause = "WHERE p.cliente_id = ?"
@@ -198,6 +186,19 @@ export const getPagosByClient = async (req, res) => {
       queryParams.push(estado)
     }
 
+    // Consulta de conteo
+    const [countResult] = await pool.query(
+      `
+      SELECT COUNT(*) as total
+      FROM pagos_cuenta_corriente p
+      ${whereClause}
+    `,
+      queryParams,
+    )
+
+    const totalItems = countResult[0].total
+
+    // Consulta de datos con paginación
     const [pagos] = await pool.query(
       `
       SELECT 
@@ -216,30 +217,47 @@ export const getPagosByClient = async (req, res) => {
       JOIN usuarios u ON p.usuario_id = u.id
       LEFT JOIN movimientos_cuenta_corriente mcc ON p.movimiento_cuenta_id = mcc.id
       ${whereClause}
-      ORDER BY p.fecha_pago DESC, p.id DESC
+      ORDER BY p.fecha_creacion DESC, p.id DESC
       LIMIT ? OFFSET ?
     `,
       [...queryParams, Number.parseInt(limit), Number.parseInt(offset)],
     )
 
-    // Convertir fechas a ISO
+    // Convertir fechas a ISO - USAR fecha_creacion en lugar de fecha_pago
     const pagosConFecha = pagos.map((pago) => ({
       ...pago,
       fecha_pago: pago.fecha_pago.toISOString().split("T")[0],
       fecha_creacion: pago.fecha_creacion.toISOString(),
+      // Agregar fecha_display que usa fecha_creacion
+      fecha_display: pago.fecha_creacion.toISOString(),
     }))
 
+    // Calcular información de paginación
+    const totalPages = Math.ceil(totalItems / Number.parseInt(limit))
+    const currentPage = Math.floor(Number.parseInt(offset) / Number.parseInt(limit)) + 1
+
     res.status(200).json({
-      cliente: client[0],
-      pagos: pagosConFecha,
+      success: true,
+      data: {
+        cliente: client[0],
+        pagos: pagosConFecha,
+      },
+      pagination: {
+        currentPage,
+        totalPages,
+        totalItems,
+        itemsPerPage: Number.parseInt(limit),
+        hasNextPage: currentPage < totalPages,
+        hasPrevPage: currentPage > 1,
+      },
     })
   } catch (error) {
     console.error("Error al obtener pagos:", error)
-    res.status(500).json({ message: "Error al obtener pagos" })
+    res.status(500).json({ success: false, message: "Error al obtener pagos" })
   }
 }
 
-// Obtener todos los pagos con filtros
+// Obtener todos los pagos con filtros Y PAGINACIÓN
 export const getPagos = async (req, res) => {
   try {
     const {
@@ -273,50 +291,83 @@ export const getPagos = async (req, res) => {
       WHERE 1=1
     `
 
+    let countQuery = `
+      SELECT COUNT(*) as total
+      FROM pagos_cuenta_corriente p
+      JOIN clientes c ON p.cliente_id = c.id
+      WHERE 1=1
+    `
+
     const queryParams = []
 
     // Filtros
     if (cliente) {
       query += ` AND c.nombre LIKE ?`
+      countQuery += ` AND c.nombre LIKE ?`
       queryParams.push(`%${cliente}%`)
     }
 
+    // CAMBIO IMPORTANTE: Usar fecha_creacion para filtros en lugar de fecha_pago
     if (fechaInicio) {
-      query += ` AND DATE(p.fecha_pago) >= ?`
+      query += ` AND DATE(p.fecha_creacion) >= ?`
+      countQuery += ` AND DATE(p.fecha_creacion) >= ?`
       queryParams.push(fechaInicio)
     }
 
     if (fechaFin) {
-      query += ` AND DATE(p.fecha_pago) <= ?`
+      query += ` AND DATE(p.fecha_creacion) <= ?`
+      countQuery += ` AND DATE(p.fecha_creacion) <= ?`
       queryParams.push(fechaFin)
     }
 
     if (tipoPago && tipoPago !== "todos") {
       query += ` AND p.tipo_pago = ?`
+      countQuery += ` AND p.tipo_pago = ?`
       queryParams.push(tipoPago)
     }
 
     if (estado !== "todos") {
       query += ` AND p.estado = ?`
+      countQuery += ` AND p.estado = ?`
       queryParams.push(estado)
     }
 
-    query += ` ORDER BY p.fecha_pago DESC, p.id DESC LIMIT ? OFFSET ?`
-    queryParams.push(Number.parseInt(limit), Number.parseInt(offset))
+    // Consulta de conteo
+    const [countResult] = await pool.query(countQuery, queryParams)
+    const totalItems = countResult[0].total
 
-    const [pagos] = await pool.query(query, queryParams)
+    // Consulta de datos con paginación
+    query += ` ORDER BY p.fecha_creacion DESC, p.id DESC LIMIT ? OFFSET ?`
+    const [pagos] = await pool.query(query, [...queryParams, Number.parseInt(limit), Number.parseInt(offset)])
 
-    // Convertir fechas a ISO
+    // Convertir fechas a ISO - USAR fecha_creacion
     const pagosConFecha = pagos.map((pago) => ({
       ...pago,
       fecha_pago: pago.fecha_pago.toISOString().split("T")[0],
       fecha_creacion: pago.fecha_creacion.toISOString(),
+      // Agregar fecha_display que usa fecha_creacion
+      fecha_display: pago.fecha_creacion.toISOString(),
     }))
 
-    res.status(200).json(pagosConFecha)
+    // Calcular información de paginación
+    const totalPages = Math.ceil(totalItems / Number.parseInt(limit))
+    const currentPage = Math.floor(Number.parseInt(offset) / Number.parseInt(limit)) + 1
+
+    res.status(200).json({
+      success: true,
+      data: pagosConFecha,
+      pagination: {
+        currentPage,
+        totalPages,
+        totalItems,
+        itemsPerPage: Number.parseInt(limit),
+        hasNextPage: currentPage < totalPages,
+        hasPrevPage: currentPage > 1,
+      },
+    })
   } catch (error) {
     console.error("Error al obtener pagos:", error)
-    res.status(500).json({ message: "Error al obtener pagos" })
+    res.status(500).json({ success: false, message: "Error al obtener pagos" })
   }
 }
 
@@ -356,37 +407,79 @@ export const getPagoById = async (req, res) => {
     )
 
     if (pagos.length === 0) {
-      return res.status(404).json({ message: "Pago no encontrado" })
+      return res.status(404).json({ success: false, message: "Pago no encontrado" })
     }
 
     const pago = {
       ...pagos[0],
       fecha_pago: pagos[0].fecha_pago.toISOString().split("T")[0],
       fecha_creacion: pagos[0].fecha_creacion.toISOString(),
+      // Agregar fecha_display que usa fecha_creacion
+      fecha_display: pagos[0].fecha_creacion.toISOString(),
     }
 
-    res.status(200).json(pago)
+    res.status(200).json({ success: true, data: pago })
   } catch (error) {
     console.error("Error al obtener pago:", error)
-    res.status(500).json({ message: "Error al obtener pago" })
+    res.status(500).json({ success: false, message: "Error al obtener pago" })
   }
 }
 
-// Obtener resumen de cuenta corriente
+// Obtener resumen de cuenta corriente CON PAGINACIÓN - FUNCIÓN CORREGIDA CON TODOS LOS FILTROS
 export const getResumenCuentaCorriente = async (req, res) => {
   try {
-    const { conSaldo = "todos" } = req.query
+    const { cliente = "", fechaInicio = "", fechaFin = "", conSaldo = "todos", limit = 50, offset = 0 } = req.query
 
     let whereClause = "WHERE c.activo = TRUE AND c.tiene_cuenta_corriente = TRUE"
     const queryParams = []
 
-    if (conSaldo === "true") {
-      whereClause += " AND c.saldo_cuenta_corriente > 0.01"
-    } else if (conSaldo === "false") {
-      whereClause += " AND c.saldo_cuenta_corriente <= 0.01"
+    // Filtro por nombre de cliente
+    if (cliente && cliente.trim() !== "") {
+      whereClause += " AND c.nombre LIKE ?"
+      queryParams.push(`%${cliente.trim()}%`)
     }
 
-    // Obtener cuentas corrientes
+    // Filtro por estado de saldo
+    if (conSaldo === "con_saldo") {
+      whereClause += " AND c.saldo_cuenta_corriente > 0.01" // Clientes con deuda
+    } else if (conSaldo === "sin_saldo") {
+      whereClause += " AND c.saldo_cuenta_corriente <= 0.01 AND c.saldo_cuenta_corriente >= -0.01" // Clientes sin deuda (saldo ~0)
+    } else if (conSaldo === "a_favor") {
+      whereClause += " AND c.saldo_cuenta_corriente < -0.01" // Clientes con saldo a favor
+    }
+
+    // Para filtros de fecha, necesitamos filtrar por la última actividad
+    let dateFilterClause = ""
+    if (fechaInicio || fechaFin) {
+      dateFilterClause = " AND EXISTS (SELECT 1 FROM movimientos_cuenta_corriente mcc WHERE mcc.cliente_id = c.id"
+
+      if (fechaInicio) {
+        dateFilterClause += " AND DATE(mcc.fecha_movimiento) >= ?"
+        queryParams.push(fechaInicio)
+      }
+
+      if (fechaFin) {
+        dateFilterClause += " AND DATE(mcc.fecha_movimiento) <= ?"
+        queryParams.push(fechaFin)
+      }
+
+      dateFilterClause += ")"
+      whereClause += dateFilterClause
+    }
+
+    // Consulta de conteo
+    const [countResult] = await pool.query(
+      `
+      SELECT COUNT(*) as total
+      FROM clientes c
+      ${whereClause}
+    `,
+      queryParams,
+    )
+
+    const totalItems = countResult[0].total
+
+    // Obtener cuentas corrientes con paginación
     const [cuentas] = await pool.query(
       `
       SELECT 
@@ -396,9 +489,10 @@ export const getResumenCuentaCorriente = async (req, res) => {
         c.email as cliente_email,
         c.limite_credito,
         c.saldo_cuenta_corriente as saldo_actual,
+        -- Saldo disponible: límite de crédito menos el saldo actual (puede ser negativo si excede el límite, o positivo si tiene crédito a favor)
         CASE 
-          WHEN c.limite_credito IS NULL THEN 999999999
-          ELSE GREATEST(0, c.limite_credito - c.saldo_cuenta_corriente)
+          WHEN c.limite_credito IS NULL THEN 999999999 -- Representa un límite ilimitado
+          ELSE (c.limite_credito - c.saldo_cuenta_corriente)
         END as saldo_disponible,
         c.fecha_actualizacion,
         (SELECT MAX(fecha_movimiento) FROM movimientos_cuenta_corriente WHERE cliente_id = c.id) as ultima_actividad,
@@ -406,15 +500,16 @@ export const getResumenCuentaCorriente = async (req, res) => {
       FROM clientes c
       ${whereClause}
       ORDER BY c.saldo_cuenta_corriente DESC, c.nombre ASC
+      LIMIT ? OFFSET ?
     `,
-      queryParams,
+      [...queryParams, Number.parseInt(limit), Number.parseInt(offset)],
     )
 
-    // Obtener totales generales
+    // Obtener totales generales (sin filtros para mantener estadísticas globales)
     const [totales] = await pool.query(`
       SELECT 
         COUNT(*) as total_cuentas,
-        SUM(CASE WHEN saldo_cuenta_corriente > 0.01 THEN 1 ELSE 0 END) as cuentas_con_saldo,
+        SUM(CASE WHEN saldo_cuenta_corriente > 0.01 THEN 1 ELSE 0 END) as cuentas_con_saldo, -- Cuentas con deuda
         SUM(saldo_cuenta_corriente) as saldo_total,
         AVG(saldo_cuenta_corriente) as saldo_promedio,
         SUM(CASE WHEN limite_credito IS NOT NULL THEN limite_credito ELSE 0 END) as limite_total
@@ -422,14 +517,14 @@ export const getResumenCuentaCorriente = async (req, res) => {
       WHERE tiene_cuenta_corriente = TRUE AND activo = TRUE
     `)
 
-    // Obtener estadísticas de pagos del mes actual
+    // CAMBIO IMPORTANTE: Usar fecha_creacion para estadísticas de pagos del mes actual
     const [pagosMes] = await pool.query(`
       SELECT 
         COUNT(*) as total_pagos,
         COALESCE(SUM(monto), 0) as monto_total_pagos
       FROM pagos_cuenta_corriente
-      WHERE MONTH(fecha_pago) = MONTH(CURRENT_DATE())
-      AND YEAR(fecha_pago) = YEAR(CURRENT_DATE())
+      WHERE MONTH(fecha_creacion) = MONTH(CURRENT_DATE())
+      AND YEAR(fecha_creacion) = YEAR(CURRENT_DATE())
       AND estado = 'activo'
     `)
 
@@ -452,21 +547,39 @@ export const getResumenCuentaCorriente = async (req, res) => {
       ultima_actividad: cuenta.ultima_actividad ? cuenta.ultima_actividad.toISOString() : null,
     }))
 
+    // Calcular información de paginación
+    const totalPages = Math.ceil(totalItems / Number.parseInt(limit))
+    const currentPage = Math.floor(Number.parseInt(offset) / Number.parseInt(limit)) + 1
+
     res.status(200).json({
-      cuentas: cuentasConFecha,
-      resumen: {
-        ...totales[0],
-        pagos_mes_actual: pagosMes[0],
-        ventas_mes_actual: ventasMes[0],
+      success: true,
+      data: {
+        cuentas: cuentasConFecha,
+        resumen: {
+          ...totales[0],
+          pagos_mes_actual: pagosMes[0],
+          ventas_mes_actual: ventasMes[0],
+          // Agregar estadísticas de los resultados filtrados
+          total_cuentas_filtradas: cuentas.length,
+          saldo_total_filtrado: cuentas.reduce((sum, cuenta) => sum + cuenta.saldo_actual, 0),
+        },
+      },
+      pagination: {
+        currentPage,
+        totalPages,
+        totalItems,
+        itemsPerPage: Number.parseInt(limit),
+        hasNextPage: currentPage < totalPages,
+        hasPrevPage: currentPage > 1,
       },
     })
   } catch (error) {
     console.error("Error al obtener resumen de cuenta corriente:", error)
-    res.status(500).json({ message: "Error al obtener resumen de cuenta corriente" })
+    res.status(500).json({ success: false, message: "Error al obtener resumen de cuenta corriente" })
   }
 }
 
-// Crear ajuste manual de cuenta corriente
+// CREAR AJUSTE MANUAL DE CUENTA CORRIENTE - LÓGICA CORREGIDA
 export const crearAjuste = async (req, res) => {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
@@ -480,56 +593,64 @@ export const crearAjuste = async (req, res) => {
 
     const {
       cliente_id,
-      tipo, // 'debito' o 'credito'
+      tipo, // 'aumentar_saldo' o 'disminuir_saldo'
       monto,
       concepto,
       notas = "",
     } = req.body
 
+    const montoNumerico = Number.parseFloat(monto)
+
     // Validar que el monto sea positivo
-    if (monto <= 0) {
+    if (isNaN(montoNumerico) || montoNumerico <= 0) {
       await connection.rollback()
-      return res.status(400).json({ message: "El monto debe ser mayor a 0" })
+      return res.status(400).json({ success: false, message: "El monto debe ser un número mayor a 0" })
     }
 
-    // Validar que el cliente existe y tiene cuenta corriente
+    // Obtener el saldo actual y datos del cliente con FOR UPDATE para bloquear la fila
     const [clientData] = await connection.query(
-      `SELECT 
-        c.id, 
-        c.nombre, 
-        c.tiene_cuenta_corriente,
-        c.saldo_cuenta_corriente,
-        c.limite_credito
-      FROM clientes c
-      WHERE c.id = ? AND c.activo = TRUE AND c.tiene_cuenta_corriente = TRUE`,
+      "SELECT id, nombre, tiene_cuenta_corriente, saldo_cuenta_corriente, limite_credito FROM clientes WHERE id = ? AND activo = TRUE AND tiene_cuenta_corriente = TRUE FOR UPDATE",
       [cliente_id],
     )
 
     if (clientData.length === 0) {
       await connection.rollback()
-      return res.status(404).json({ message: "Cliente no encontrado o no tiene cuenta corriente activa" })
+      return res
+        .status(404)
+        .json({ success: false, message: "Cliente no encontrado o no tiene cuenta corriente activa" })
     }
 
     const cliente = clientData[0]
-
-    const saldoAnterior = cliente.saldo_cuenta_corriente
+    // Asegurar que el saldo anterior sea un número
+    const saldoAnterior = Number.parseFloat(cliente.saldo_cuenta_corriente)
     let nuevoSaldo
+    let tipoMovimiento
+    let conceptoMovimiento
 
-    // Calcular nuevo saldo según el tipo de ajuste
-    if (tipo === "debito") {
-      // Débito aumenta la deuda (suma al saldo)
-      nuevoSaldo = saldoAnterior + monto
+    if (tipo === "aumentar_saldo") {
+      // AUMENTAR SALDO = AUMENTAR DEUDA DEL CLIENTE
+      nuevoSaldo = saldoAnterior + montoNumerico
+      tipoMovimiento = "debito"
+      conceptoMovimiento = "nota_debito"
 
       // Verificar límite de crédito si existe
-      if (cliente.limite_credito && nuevoSaldo > cliente.limite_credito) {
+      if (cliente.limite_credito !== null && nuevoSaldo > cliente.limite_credito) {
         await connection.rollback()
         return res.status(400).json({
-          message: `El ajuste excede el límite de crédito. Límite: $${cliente.limite_credito.toFixed(2)}, Saldo actual: $${saldoAnterior.toFixed(2)}, Monto del ajuste: $${monto.toFixed(2)}`,
+          success: false,
+          message: `El ajuste excede el límite de crédito. Límite: $${Number(cliente.limite_credito).toFixed(2)}, Saldo actual: $${saldoAnterior.toFixed(2)}, Monto del ajuste: $${montoNumerico.toFixed(2)}`,
         })
       }
+    } else if (tipo === "disminuir_saldo") {
+      // DISMINUIR SALDO = DISMINUIR DEUDA DEL CLIENTE
+      nuevoSaldo = saldoAnterior - montoNumerico
+      tipoMovimiento = "credito"
+      conceptoMovimiento = "nota_credito"
     } else {
-      // Crédito disminuye la deuda (resta del saldo)
-      nuevoSaldo = Math.max(0, saldoAnterior - monto)
+      await connection.rollback()
+      return res
+        .status(400)
+        .json({ success: false, message: "Tipo de ajuste inválido. Use 'aumentar_saldo' o 'disminuir_saldo'" })
     }
 
     // Actualizar saldo de la cuenta corriente
@@ -539,7 +660,6 @@ export const crearAjuste = async (req, res) => {
     ])
 
     // Crear movimiento de cuenta corriente
-    const conceptoMovimiento = tipo === "debito" ? "nota_debito" : "nota_credito"
     const [movimientoResult] = await connection.query(
       `
       INSERT INTO movimientos_cuenta_corriente (
@@ -551,34 +671,37 @@ export const crearAjuste = async (req, res) => {
       [
         cliente_id,
         req.user.id,
-        tipo,
+        tipoMovimiento,
         conceptoMovimiento,
-        monto,
+        montoNumerico,
         saldoAnterior,
         nuevoSaldo,
-        `Ajuste ${tipo}: ${concepto}${notas ? " - " + notas : ""}`,
+        `Ajuste ${tipo === "aumentar_saldo" ? "aumentar" : "disminuir"} saldo: ${concepto}${notas ? " - " + notas : ""}`,
       ],
     )
 
     await connection.commit()
 
     res.status(201).json({
+      success: true,
       message: "Ajuste registrado exitosamente",
       data: {
         id: movimientoResult.insertId,
         tipo,
-        monto,
+        tipoMovimiento,
+        monto: montoNumerico,
         saldoAnterior,
         nuevoSaldo,
         cliente: cliente.nombre,
+        descripcion: `${tipo === "aumentar_saldo" ? "Aumentó" : "Disminuyó"} el saldo en $${montoNumerico.toFixed(2)}`,
       },
     })
   } catch (error) {
     await connection.rollback()
     console.error("Error al crear ajuste:", error)
-    res.status(500).json({ message: error.message || "Error al crear ajuste" })
+    res.status(500).json({ success: false, message: error.message || "Error al crear ajuste" })
   } finally {
-    connection.release()
+    if (connection) connection.release()
   }
 }
 
@@ -607,7 +730,7 @@ export const anularPago = async (req, res) => {
 
     if (pagos.length === 0) {
       await connection.rollback()
-      return res.status(404).json({ message: "Pago no encontrado o ya está anulado" })
+      return res.status(404).json({ success: false, message: "Pago no encontrado o ya está anulado" })
     }
 
     const pago = pagos[0]
@@ -625,6 +748,7 @@ export const anularPago = async (req, res) => {
     if (pago.limite_credito && nuevoSaldo > pago.limite_credito) {
       await connection.rollback()
       return res.status(400).json({
+        success: false,
         message: `La anulación del pago excedería el límite de crédito. Límite: $${pago.limite_credito.toFixed(2)}, Saldo resultante: $${nuevoSaldo.toFixed(2)}`,
       })
     }
@@ -665,6 +789,7 @@ export const anularPago = async (req, res) => {
     await connection.commit()
 
     res.status(200).json({
+      success: true,
       message: "Pago anulado exitosamente",
       data: {
         id,
@@ -679,17 +804,17 @@ export const anularPago = async (req, res) => {
   } catch (error) {
     await connection.rollback()
     console.error("Error al anular pago:", error)
-    res.status(500).json({ message: error.message || "Error al anular pago" })
+    res.status(500).json({ success: false, message: error.message || "Error al anular pago" })
   } finally {
     connection.release()
   }
 }
 
-// Obtener movimientos de cuenta corriente de un cliente
+// Obtener movimientos de cuenta corriente de un cliente CON PAGINACIÓN
 export const getMovimientosByClient = async (req, res) => {
   try {
     const { clientId } = req.params
-    const { limit = 50, offset = 0, tipo = "", concepto = "" } = req.query
+    const { limit = 50, offset = 0, tipo = "", concepto = "", fechaInicio = "", fechaFin = "" } = req.query
 
     // Verificar que el cliente existe
     const [client] = await pool.query(
@@ -698,11 +823,11 @@ export const getMovimientosByClient = async (req, res) => {
     )
 
     if (client.length === 0) {
-      return res.status(404).json({ message: "Cliente no encontrado" })
+      return res.status(404).json({ success: false, message: "Cliente no encontrado" })
     }
 
     if (!client[0].tiene_cuenta_corriente) {
-      return res.status(400).json({ message: "El cliente no tiene cuenta corriente habilitada" })
+      return res.status(400).json({ success: false, message: "El cliente no tiene cuenta corriente habilitada" })
     }
 
     let query = `
@@ -714,22 +839,46 @@ export const getMovimientosByClient = async (req, res) => {
       WHERE m.cliente_id = ?
     `
 
+    let countQuery = `
+      SELECT COUNT(*) as total
+      FROM movimientos_cuenta_corriente m
+      WHERE m.cliente_id = ?
+    `
+
     const queryParams = [clientId]
 
     if (tipo && tipo !== "todos") {
       query += ` AND m.tipo = ?`
+      countQuery += ` AND m.tipo = ?`
       queryParams.push(tipo)
     }
 
     if (concepto && concepto !== "todos") {
       query += ` AND m.concepto = ?`
+      countQuery += ` AND m.concepto = ?`
       queryParams.push(concepto)
     }
 
-    query += ` ORDER BY m.fecha_movimiento DESC, m.id DESC LIMIT ? OFFSET ?`
-    queryParams.push(Number.parseInt(limit), Number.parseInt(offset))
+    // Agregar filtros de fecha usando fecha_movimiento
+    if (fechaInicio) {
+      query += ` AND DATE(m.fecha_movimiento) >= ?`
+      countQuery += ` AND DATE(m.fecha_movimiento) >= ?`
+      queryParams.push(fechaInicio)
+    }
 
-    const [movimientos] = await pool.query(query, queryParams)
+    if (fechaFin) {
+      query += ` AND DATE(m.fecha_movimiento) <= ?`
+      countQuery += ` AND DATE(m.fecha_movimiento) <= ?`
+      queryParams.push(fechaFin)
+    }
+
+    // Consulta de conteo
+    const [countResult] = await pool.query(countQuery, queryParams)
+    const totalItems = countResult[0].total
+
+    // Consulta de datos con paginación
+    query += ` ORDER BY m.fecha_movimiento DESC, m.id DESC LIMIT ? OFFSET ?`
+    const [movimientos] = await pool.query(query, [...queryParams, Number.parseInt(limit), Number.parseInt(offset)])
 
     // Convertir fechas a ISO
     const movimientosConFecha = movimientos.map((mov) => ({
@@ -737,13 +886,28 @@ export const getMovimientosByClient = async (req, res) => {
       fecha_movimiento: mov.fecha_movimiento.toISOString(),
     }))
 
+    // Calcular información de paginación
+    const totalPages = Math.ceil(totalItems / Number.parseInt(limit))
+    const currentPage = Math.floor(Number.parseInt(offset) / Number.parseInt(limit)) + 1
+
     res.status(200).json({
-      cliente: client[0],
-      movimientos: movimientosConFecha,
+      success: true,
+      data: {
+        cliente: client[0],
+        movimientos: movimientosConFecha,
+      },
+      pagination: {
+        currentPage,
+        totalPages,
+        totalItems,
+        itemsPerPage: Number.parseInt(limit),
+        hasNextPage: currentPage < totalPages,
+        hasPrevPage: currentPage > 1,
+      },
     })
   } catch (error) {
     console.error("Error al obtener movimientos:", error)
-    res.status(500).json({ message: "Error al obtener movimientos de cuenta corriente" })
+    res.status(500).json({ success: false, message: "Error al obtener movimientos de cuenta corriente" })
   }
 }
 
@@ -813,7 +977,7 @@ export const getEstadisticasCuentaCorriente = async (req, res) => {
       LIMIT 10
     `)
 
-    // Estadísticas de pagos por tipo
+    // CAMBIO IMPORTANTE: Usar fecha_creacion para estadísticas de pagos por tipo
     const [pagosPorTipo] = await pool.query(
       `
       SELECT 
@@ -822,8 +986,8 @@ export const getEstadisticasCuentaCorriente = async (req, res) => {
         SUM(monto) as total_monto
       FROM pagos_cuenta_corriente p
       WHERE p.estado = 'activo'
-      ${fechaInicio ? "AND DATE(p.fecha_pago) >= ?" : ""}
-      ${fechaFin ? "AND DATE(p.fecha_pago) <= ?" : ""}
+      ${fechaInicio ? "AND DATE(p.fecha_creacion) >= ?" : ""}
+      ${fechaFin ? "AND DATE(p.fecha_creacion) <= ?" : ""}
       GROUP BY tipo_pago
       ORDER BY total_monto DESC
     `,
@@ -831,16 +995,19 @@ export const getEstadisticasCuentaCorriente = async (req, res) => {
     )
 
     res.status(200).json({
-      movimientosPorTipo,
-      evolucionSaldos: evolucionSaldos.map((item) => ({
-        ...item,
-        fecha: item.fecha.toISOString().split("T")[0],
-      })),
-      clientesMayorDeuda,
-      pagosPorTipo,
+      success: true,
+      data: {
+        movimientosPorTipo,
+        evolucionSaldos: evolucionSaldos.map((item) => ({
+          ...item,
+          fecha: item.fecha.toISOString().split("T")[0],
+        })),
+        clientesMayorDeuda,
+        pagosPorTipo,
+      },
     })
   } catch (error) {
     console.error("Error al obtener estadísticas:", error)
-    res.status(500).json({ message: "Error al obtener estadísticas de cuenta corriente" })
+    res.status(500).json({ success: false, message: "Error al obtener estadísticas de cuenta corriente" })
   }
 }

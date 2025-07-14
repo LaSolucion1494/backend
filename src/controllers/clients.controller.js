@@ -1,88 +1,74 @@
-// clients.controller.js - CORREGIDO PARA MOSTRAR SALDOS CORRECTAMENTE
+// clients.controller.js - ACTUALIZADO CON PAGINACIÓN COMPLETA
 import pool from "../db.js"
 import { validationResult } from "express-validator"
 
-// Obtener todos los clientes con filtros (CORREGIDO para mostrar saldos)
+// Obtener todos los clientes con filtros y paginación
 export const getClients = async (req, res) => {
   try {
-    const { search = "", activo = "true", conCuentaCorriente = "", limit = 50, offset = 0 } = req.query
+    const { search = "", activo = "todos", conCuentaCorriente = "todos", limit = 10, offset = 0 } = req.query
 
-    let query = `
-      SELECT 
-        c.id,
-        c.nombre,
-        c.telefono,
-        c.email,
-        c.direccion,
-        c.cuit,
-        c.notas,
-        c.activo,
-        c.tiene_cuenta_corriente,
-        c.limite_credito,
-        c.saldo_cuenta_corriente,
-        c.fecha_creacion,
-        c.fecha_actualizacion,
-        CASE 
-          WHEN c.limite_credito IS NULL THEN 999999999
-          ELSE GREATEST(0, c.limite_credito - c.saldo_cuenta_corriente)
-        END as saldo_disponible
-      FROM clientes c
-      WHERE 1=1
-    `
-
+    let baseQuery = `FROM clientes c WHERE 1=1`
     const queryParams = []
 
     // Filtro de búsqueda
     if (search) {
-      query += ` AND (
-        c.nombre LIKE ? OR 
-        c.telefono LIKE ? OR 
-        c.email LIKE ? OR
-        c.cuit LIKE ?
-      )`
+      baseQuery += ` AND (c.nombre LIKE ? OR c.telefono LIKE ? OR c.email LIKE ? OR c.cuit LIKE ?)`
       const searchTerm = `%${search}%`
       queryParams.push(searchTerm, searchTerm, searchTerm, searchTerm)
     }
 
     // Filtro por estado activo
     if (activo !== "todos") {
-      query += ` AND c.activo = ?`
+      baseQuery += ` AND c.activo = ?`
       queryParams.push(activo === "true")
     }
 
     // Filtro por cuenta corriente
     if (conCuentaCorriente === "true") {
-      query += ` AND c.tiene_cuenta_corriente = TRUE`
+      baseQuery += ` AND c.tiene_cuenta_corriente = TRUE`
     } else if (conCuentaCorriente === "false") {
-      query += ` AND c.tiene_cuenta_corriente = FALSE`
+      baseQuery += ` AND c.tiene_cuenta_corriente = FALSE`
     }
 
-    // Ordenar y paginar
-    query += ` ORDER BY c.nombre ASC LIMIT ? OFFSET ?`
-    queryParams.push(Number.parseInt(limit), Number.parseInt(offset))
+    // --- NUEVO: Query para contar el total de resultados ---
+    const countQuery = `SELECT COUNT(*) as total ${baseQuery}`
+    const [[{ total }]] = await pool.query(countQuery, queryParams)
 
-    const [clients] = await pool.query(query, queryParams)
+    // --- Query para obtener los datos paginados ---
+    const dataQuery = `
+      SELECT 
+        c.id, c.nombre, c.telefono, c.email, c.direccion, c.cuit, c.notas, c.activo,
+        c.tiene_cuenta_corriente, c.limite_credito, c.saldo_cuenta_corriente,
+        c.fecha_creacion, c.fecha_actualizacion,
+        CASE 
+          WHEN c.limite_credito IS NULL THEN 999999999
+          ELSE GREATEST(0, c.limite_credito - c.saldo_cuenta_corriente)
+        END as saldo_disponible
+      ${baseQuery}
+      ORDER BY c.nombre ASC
+      LIMIT ? OFFSET ?
+    `
+    const finalDataParams = [...queryParams, Number.parseInt(limit), Number.parseInt(offset)]
+    const [clients] = await pool.query(dataQuery, finalDataParams)
 
-    // CORREGIDO: Mantener los nombres de campos originales de la BD
     const clientsWithISODate = clients.map((client) => ({
-      id: client.id,
-      nombre: client.nombre,
-      telefono: client.telefono,
-      email: client.email,
-      direccion: client.direccion,
-      cuit: client.cuit,
-      notas: client.notas,
-      activo: client.activo,
-      tiene_cuenta_corriente: client.tiene_cuenta_corriente,
-      limite_credito: client.limite_credito,
-      // CORREGIDO: Usar el nombre original del campo de la BD
+      ...client,
       saldo_cuenta_corriente: client.saldo_cuenta_corriente || 0,
       saldo_disponible: client.saldo_disponible || 0,
       fecha_creacion: client.fecha_creacion.toISOString(),
       fecha_actualizacion: client.fecha_actualizacion.toISOString(),
     }))
 
-    res.status(200).json(clientsWithISODate)
+    // --- NUEVO: Estructura de respuesta con datos y paginación ---
+    res.status(200).json({
+      data: clientsWithISODate,
+      pagination: {
+        totalItems: total,
+        totalPages: Math.ceil(total / limit),
+        currentPage: Math.floor(offset / limit) + 1,
+        itemsPerPage: Number.parseInt(limit),
+      },
+    })
   } catch (error) {
     console.error("Error al obtener clientes:", error)
     res.status(500).json({ message: "Error al obtener clientes" })
@@ -124,7 +110,6 @@ export const getClientById = async (req, res) => {
       notas: clientData.notas,
       activo: clientData.activo,
       tiene_cuenta_corriente: clientData.tiene_cuenta_corriente,
-      // CORREGIDO: Incluir el saldo directamente en el objeto principal
       limite_credito: clientData.limite_credito,
       saldo_cuenta_corriente: clientData.saldo_cuenta_corriente || 0,
       saldo_disponible: clientData.saldo_disponible || 0,
@@ -132,7 +117,6 @@ export const getClientById = async (req, res) => {
       fecha_actualizacion: clientData.fecha_actualizacion.toISOString(),
     }
 
-    // Si tiene cuenta corriente, agregar información adicional
     if (client.tiene_cuenta_corriente) {
       client.cuenta_corriente = {
         limite_credito: clientData.limite_credito,
@@ -171,24 +155,18 @@ export const createClient = async (req, res) => {
       limiteCredito = null,
     } = req.body
 
-    // Verificar si ya existe un cliente con el mismo nombre
-    const [existingClient] = await connection.query(
-      "SELECT id FROM clientes WHERE nombre = ? AND id != 1", // Excluir cliente por defecto
-      [nombre],
-    )
+    const [existingClient] = await connection.query("SELECT id FROM clientes WHERE nombre = ? AND id != 1", [nombre])
 
     if (existingClient.length > 0) {
       await connection.rollback()
       return res.status(400).json({ message: "Ya existe un cliente con ese nombre" })
     }
 
-    // Validar límite de crédito si tiene cuenta corriente
     if (tieneCuentaCorriente && limiteCredito !== null && limiteCredito < 0) {
       await connection.rollback()
       return res.status(400).json({ message: "El límite de crédito no puede ser negativo" })
     }
 
-    // Insertar cliente con campos de cuenta corriente integrados
     const [result] = await connection.query(
       `
       INSERT INTO clientes (
@@ -249,13 +227,11 @@ export const updateClient = async (req, res) => {
       limiteCredito = null,
     } = req.body
 
-    // Verificar que no sea el cliente por defecto (id=1)
     if (Number(id) === 1) {
       await connection.rollback()
       return res.status(400).json({ message: "No se puede modificar el cliente por defecto" })
     }
 
-    // Verificar si el cliente existe
     const [existingClient] = await connection.query(
       "SELECT tiene_cuenta_corriente, saldo_cuenta_corriente FROM clientes WHERE id = ?",
       [id],
@@ -266,7 +242,6 @@ export const updateClient = async (req, res) => {
       return res.status(404).json({ message: "Cliente no encontrado" })
     }
 
-    // Verificar si ya existe otro cliente con el mismo nombre
     const [duplicateClient] = await connection.query(
       "SELECT id FROM clientes WHERE nombre = ? AND id != ? AND id != 1",
       [nombre, id],
@@ -279,13 +254,11 @@ export const updateClient = async (req, res) => {
 
     const teniaCC = existingClient[0].tiene_cuenta_corriente
 
-    // Validar límite de crédito si tiene cuenta corriente
     if (tieneCuentaCorriente && limiteCredito !== null && limiteCredito < 0) {
       await connection.rollback()
       return res.status(400).json({ message: "El límite de crédito no puede ser negativo" })
     }
 
-    // Si está desactivando la cuenta corriente, verificar que no tenga saldo
     if (teniaCC && !tieneCuentaCorriente && Math.abs(existingClient[0].saldo_cuenta_corriente) > 0.01) {
       await connection.rollback()
       return res.status(400).json({
@@ -293,18 +266,11 @@ export const updateClient = async (req, res) => {
       })
     }
 
-    // Actualizar cliente con campos de cuenta corriente integrados
     await connection.query(
       `
       UPDATE clientes SET
-        nombre = ?,
-        telefono = ?,
-        email = ?,
-        direccion = ?,
-        cuit = ?,
-        notas = ?,
-        tiene_cuenta_corriente = ?,
-        limite_credito = ?
+        nombre = ?, telefono = ?, email = ?, direccion = ?, cuit = ?, notas = ?,
+        tiene_cuenta_corriente = ?, limite_credito = ?
       WHERE id = ?
       `,
       [
@@ -342,13 +308,11 @@ export const toggleClientStatus = async (req, res) => {
     const { id } = req.params
     const { activo } = req.body
 
-    // Verificar que no sea el cliente por defecto (id=1)
     if (Number(id) === 1) {
       await connection.rollback()
       return res.status(400).json({ message: "No se puede desactivar el cliente por defecto" })
     }
 
-    // Verificar si el cliente existe y obtener info de cuenta corriente
     const [existingClient] = await connection.query(
       `SELECT id, tiene_cuenta_corriente, saldo_cuenta_corriente FROM clientes WHERE id = ?`,
       [id],
@@ -361,7 +325,6 @@ export const toggleClientStatus = async (req, res) => {
 
     const cliente = existingClient[0]
 
-    // Si se está desactivando y tiene cuenta corriente con saldo, no permitir
     if (!activo && cliente.tiene_cuenta_corriente && Math.abs(cliente.saldo_cuenta_corriente) > 0.01) {
       await connection.rollback()
       return res.status(400).json({
@@ -369,7 +332,6 @@ export const toggleClientStatus = async (req, res) => {
       })
     }
 
-    // Actualizar estado del cliente
     await connection.query("UPDATE clientes SET activo = ? WHERE id = ?", [activo, id])
 
     await connection.commit()
@@ -395,13 +357,11 @@ export const deleteClient = async (req, res) => {
 
     const { id } = req.params
 
-    // Verificar que no sea el cliente por defecto (id=1)
     if (Number(id) === 1) {
       await connection.rollback()
       return res.status(400).json({ message: "No se puede eliminar el cliente por defecto" })
     }
 
-    // Verificar si el cliente existe y obtener info de cuenta corriente
     const [existingClient] = await connection.query(
       `SELECT tiene_cuenta_corriente, saldo_cuenta_corriente FROM clientes WHERE id = ?`,
       [id],
@@ -414,7 +374,6 @@ export const deleteClient = async (req, res) => {
 
     const cliente = existingClient[0]
 
-    // Verificar si el cliente tiene ventas asociadas
     const [clientSales] = await connection.query("SELECT id FROM ventas WHERE cliente_id = ? LIMIT 1", [id])
 
     if (clientSales.length > 0) {
@@ -424,7 +383,6 @@ export const deleteClient = async (req, res) => {
       })
     }
 
-    // Si tiene cuenta corriente, verificar que no tenga saldo
     if (cliente.tiene_cuenta_corriente && Math.abs(cliente.saldo_cuenta_corriente) > 0.01) {
       await connection.rollback()
       return res.status(400).json({
@@ -432,11 +390,8 @@ export const deleteClient = async (req, res) => {
       })
     }
 
-    // Eliminar registros relacionados de cuenta corriente en orden correcto
     await connection.query("DELETE FROM movimientos_cuenta_corriente WHERE cliente_id = ?", [id])
     await connection.query("DELETE FROM pagos_cuenta_corriente WHERE cliente_id = ?", [id])
-
-    // Eliminar cliente
     await connection.query("DELETE FROM clientes WHERE id = ?", [id])
 
     await connection.commit()
@@ -463,14 +418,8 @@ export const searchClients = async (req, res) => {
     const [clients] = await pool.query(
       `
       SELECT 
-        c.id, 
-        c.nombre, 
-        c.telefono, 
-        c.email, 
-        c.cuit, 
-        c.tiene_cuenta_corriente,
-        c.limite_credito,
-        c.saldo_cuenta_corriente,
+        c.id, c.nombre, c.telefono, c.email, c.cuit, c.tiene_cuenta_corriente,
+        c.limite_credito, c.saldo_cuenta_corriente,
         CASE 
           WHEN c.limite_credito IS NULL THEN 999999999
           ELSE GREATEST(0, c.limite_credito - c.saldo_cuenta_corriente)
@@ -484,15 +433,8 @@ export const searchClients = async (req, res) => {
       [`%${term}%`, `%${term}%`, `%${term}%`, `%${term}%`],
     )
 
-    // CORREGIDO: Usar nombres de campos consistentes
     const clientsData = clients.map((client) => ({
-      id: client.id,
-      nombre: client.nombre,
-      telefono: client.telefono,
-      email: client.email,
-      cuit: client.cuit,
-      tiene_cuenta_corriente: client.tiene_cuenta_corriente,
-      limite_credito: client.limite_credito,
+      ...client,
       saldo_cuenta_corriente: client.saldo_cuenta_corriente || 0,
       saldo_disponible: client.saldo_disponible || 0,
     }))
@@ -512,7 +454,6 @@ export const getCuentaCorrienteByClient = async (req, res) => {
     const { clientId } = req.params
     const { limit = 50, offset = 0 } = req.query
 
-    // Verificar que el cliente existe y tiene cuenta corriente
     const [client] = await pool.query(
       "SELECT id, nombre, tiene_cuenta_corriente, limite_credito, saldo_cuenta_corriente FROM clientes WHERE id = ? AND activo = TRUE",
       [clientId],
@@ -526,27 +467,16 @@ export const getCuentaCorrienteByClient = async (req, res) => {
       return res.status(400).json({ message: "El cliente no tiene cuenta corriente habilitada" })
     }
 
-    // Calcular saldo disponible
     const saldoDisponible = client[0].limite_credito
       ? Math.max(0, client[0].limite_credito - client[0].saldo_cuenta_corriente)
-      : 999999999 // Sin límite
+      : 999999999
 
-    // Obtener movimientos
     const [movimientos] = await pool.query(
       `
       SELECT 
-        m.id,
-        m.tipo,
-        m.concepto,
-        m.monto,
-        m.saldo_anterior,
-        m.saldo_nuevo,
-        m.referencia_id,
-        m.referencia_tipo,
-        m.numero_referencia,
-        m.descripcion,
-        m.fecha_movimiento,
-        u.nombre as usuario_nombre
+        m.id, m.tipo, m.concepto, m.monto, m.saldo_anterior, m.saldo_nuevo,
+        m.referencia_id, m.referencia_tipo, m.numero_referencia, m.descripcion,
+        m.fecha_movimiento, u.nombre as usuario_nombre
       FROM movimientos_cuenta_corriente m
       JOIN usuarios u ON m.usuario_id = u.id
       WHERE m.cliente_id = ?
@@ -556,7 +486,6 @@ export const getCuentaCorrienteByClient = async (req, res) => {
       [clientId, Number.parseInt(limit), Number.parseInt(offset)],
     )
 
-    // Convertir fechas a ISO
     const movimientosConFecha = movimientos.map((mov) => ({
       ...mov,
       fecha_movimiento: mov.fecha_movimiento.toISOString(),
@@ -599,11 +528,7 @@ export const getResumenCuentasCorrientes = async (req, res) => {
     const [cuentas] = await pool.query(
       `
       SELECT 
-        c.id,
-        c.nombre,
-        c.telefono,
-        c.email,
-        c.limite_credito,
+        c.id, c.nombre, c.telefono, c.email, c.limite_credito,
         c.saldo_cuenta_corriente as saldo_actual,
         CASE 
           WHEN c.limite_credito IS NULL THEN 999999999
@@ -619,7 +544,6 @@ export const getResumenCuentasCorrientes = async (req, res) => {
       queryParams,
     )
 
-    // Obtener totales
     const [totales] = await pool.query(`
       SELECT 
         COUNT(*) as total_cuentas,
@@ -631,7 +555,6 @@ export const getResumenCuentasCorrientes = async (req, res) => {
       WHERE tiene_cuenta_corriente = TRUE AND activo = TRUE
     `)
 
-    // Obtener estadísticas de pagos del mes actual
     const [pagosMes] = await pool.query(`
       SELECT 
         COUNT(*) as total_pagos,
@@ -642,7 +565,6 @@ export const getResumenCuentasCorrientes = async (req, res) => {
       AND estado = 'activo'
     `)
 
-    // Obtener estadísticas de ventas a cuenta corriente del mes actual
     const [ventasMes] = await pool.query(`
       SELECT 
         COUNT(*) as total_ventas_cc,
@@ -654,10 +576,8 @@ export const getResumenCuentasCorrientes = async (req, res) => {
       AND YEAR(fecha_venta) = YEAR(CURRENT_DATE())
     `)
 
-    // Convertir fechas a ISO y CORREGIR: mantener nombres de campos consistentes
     const cuentasConFecha = cuentas.map((cuenta) => ({
       ...cuenta,
-      // CORREGIDO: Asegurar que se use saldo_cuenta_corriente como campo principal
       saldo_cuenta_corriente: cuenta.saldo_actual || 0,
       fecha_actualizacion: cuenta.fecha_actualizacion.toISOString(),
       ultima_actividad: cuenta.ultima_actividad ? cuenta.ultima_actividad.toISOString() : null,

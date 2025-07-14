@@ -1,64 +1,73 @@
 import { Router } from "express"
 import { check } from "express-validator"
 import {
+  createPurchase,
   getPurchases,
   getPurchaseById,
-  createPurchase,
-  updatePurchaseStatus,
   receivePurchaseItems,
   cancelPurchase,
-  getPurchasePaymentStats,
+  updatePurchase,
+  getPurchasesForReports,
+  getPurchaseStats,
 } from "../controllers/purchases.controller.js"
 import { verifyToken } from "../middlewares/verifyToken.js"
 
 const router = Router()
 
-// Validaciones para crear compra (ACTUALIZADO para incluir pagos)
-const validateCreatePurchase = [
-  check("proveedorId").isInt({ min: 1 }).withMessage("Proveedor ID debe ser un número válido"),
-  check("detalles").isArray({ min: 1 }).withMessage("Debe incluir al menos un producto"),
-  check("detalles.*.productoId").isInt({ min: 1 }).withMessage("Producto ID debe ser un número válido"),
-  check("detalles.*.cantidad").isInt({ min: 1 }).withMessage("Cantidad debe ser un número positivo"),
-  check("detalles.*.precioUnitario").isFloat({ min: 0 }).withMessage("Precio unitario debe ser un número positivo"),
-  check("subtotal").isFloat({ min: 0 }).withMessage("Subtotal debe ser un número positivo"),
-  check("total").isFloat({ min: 0 }).withMessage("Total debe ser un número positivo"),
-  check("fechaCompra").isDate().withMessage("Fecha de compra debe ser una fecha válida"),
-  check("recibirInmediatamente")
-    .optional()
-    .isBoolean()
-    .withMessage("Recibir inmediatamente debe ser verdadero o falso"),
-  // NUEVAS VALIDACIONES PARA PAGOS
-  check("pagos")
-    .isArray({ min: 1 })
-    .withMessage("Debe incluir al menos un método de pago"),
+// Validaciones para crear compra
+const validatePurchaseSchema = [
+  check("proveedorId").isInt({ min: 1 }).withMessage("Proveedor ID es requerido"),
+  check("productos").isArray({ min: 1 }).withMessage("Debe incluir al menos un producto"),
+  check("productos.*.productoId").isInt({ min: 1 }).withMessage("ID de producto inválido"),
+  check("productos.*.cantidad").isInt({ min: 1 }).withMessage("Cantidad debe ser mayor a 0"),
+  check("productos.*.precioUnitario").optional().isFloat({ min: 0 }).withMessage("Precio unitario inválido"),
+  check("descuento").optional().isFloat({ min: 0 }).withMessage("Descuento inválido"),
+  check("interes").optional().isFloat({ min: 0 }).withMessage("Interés inválido"),
+  // CORREGIDO: Validación de fecha más flexible
+  check("fechaCompra")
+    .matches(/^\d{4}-\d{2}-\d{2}$/)
+    .withMessage("Fecha de compra debe estar en formato YYYY-MM-DD")
+    .isISO8601()
+    .withMessage("Fecha de compra inválida"),
+  check("pagos").isArray({ min: 1 }).withMessage("Debe incluir al menos un método de pago"),
   check("pagos.*.tipo")
     .isIn(["efectivo", "transferencia", "tarjeta_credito", "tarjeta_debito", "otro"])
     .withMessage("Tipo de pago inválido"),
   check("pagos.*.monto").isFloat({ min: 0.01 }).withMessage("Monto de pago debe ser mayor a 0"),
-  check("pagos.*.descripcion").optional().isLength({ max: 200 }).withMessage("Descripción del pago muy larga"),
-]
-
-// Validaciones para actualizar estado
-const validateUpdateStatus = [
-  check("estado").isIn(["pendiente", "parcial", "recibida", "cancelada"]).withMessage("Estado no válido"),
+  check("observaciones").optional().isLength({ max: 500 }).withMessage("Observaciones muy largas"),
+  check("recibirInmediatamente")
+    .optional()
+    .isBoolean()
+    .withMessage("recibirInmediatamente debe ser un booleano"), // ADDED
 ]
 
 // Validaciones para recibir productos
-const validateReceiveItems = [
-  check("detallesRecibidos").isArray({ min: 1 }).withMessage("Debe incluir al menos un producto para recibir"),
-  check("detallesRecibidos.*.detalleId").isInt({ min: 1 }).withMessage("Detalle ID debe ser un número válido"),
-  check("detallesRecibidos.*.cantidadRecibida")
-    .isInt({ min: 1 })
-    .withMessage("Cantidad recibida debe ser un número positivo"),
+const validateReceiveItemsSchema = [
+  check("detallesRecibidos").isArray({ min: 1 }).withMessage("Debe incluir al menos un detalle"),
+  check("detallesRecibidos.*.detalleId").isInt({ min: 1 }).withMessage("ID de detalle inválido"),
+  check("detallesRecibidos.*.cantidadRecibida").isInt({ min: 1 }).withMessage("Cantidad recibida debe ser mayor a 0"),
 ]
 
-// Rutas
+// Validaciones para cancelar compra
+const validateCancelPurchaseSchema = [
+  check("motivo")
+    .notEmpty()
+    .isLength({ max: 200 })
+    .withMessage("El motivo de cancelación es obligatorio y no puede exceder 200 caracteres"),
+]
+
+// Rutas de consulta
 router.get("/", verifyToken(), getPurchases)
-router.get("/payment-stats", verifyToken(), getPurchasePaymentStats) // NUEVA RUTA
+router.get("/reports", verifyToken(), getPurchasesForReports)
+router.get("/stats", verifyToken(), getPurchaseStats)
 router.get("/:id", verifyToken(), getPurchaseById)
-router.post("/", verifyToken(), validateCreatePurchase, createPurchase)
-router.put("/:id/status", verifyToken(), validateUpdateStatus, updatePurchaseStatus)
-router.post("/:id/receive", verifyToken(), validateReceiveItems, receivePurchaseItems)
-router.put("/:id/cancel", verifyToken(), cancelPurchase)
+
+// Rutas de operaciones
+router.post("/", verifyToken(), validatePurchaseSchema, createPurchase)
+router.put("/:id", verifyToken(), updatePurchase)
+router.post("/:id/receive", verifyToken(), validateReceiveItemsSchema, receivePurchaseItems)
+
+// Rutas administrativas
+router.patch("/:id/cancel", verifyToken(["admin"]), validateCancelPurchaseSchema, cancelPurchase)
 
 export default router

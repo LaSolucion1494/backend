@@ -1,4 +1,4 @@
-// sales.controller.js - VERSIÓN CON VALORES HARDCODEADOS PARA CUENTA CORRIENTE
+// sales.controller.js - VERSIÓN CORREGIDA PARA REPORTES CON PAGINACIÓN
 import pool from "../db.js"
 import { validationResult } from "express-validator"
 
@@ -38,7 +38,6 @@ const getCompanyDataFromConfig = async (connection) => {
     }
   } catch (error) {
     console.error("Error al obtener datos de la empresa:", error)
-    // Retornar datos por defecto en caso de error
     return {
       nombre: "La Solución Repuestos",
       telefono: "",
@@ -53,10 +52,9 @@ const getCompanyDataFromConfig = async (connection) => {
   }
 }
 
-// Función para generar el próximo número de factura (SIN CAMBIOS)
+// Función para generar el próximo número de factura
 const generateInvoiceNumber = async (connection) => {
   try {
-    // Obtener configuración con FOR UPDATE para evitar condiciones de carrera
     const [config] = await connection.query(`
       SELECT clave, valor FROM configuracion 
       WHERE clave IN ('venta_numero_siguiente', 'venta_prefijo')
@@ -72,7 +70,6 @@ const generateInvoiceNumber = async (connection) => {
       configObj[item.clave] = item.valor
     })
 
-    // Validar que tenemos los valores necesarios
     if (!configObj.venta_numero_siguiente) {
       throw new Error("No se encontró el próximo número de factura en la configuración")
     }
@@ -85,7 +82,6 @@ const generateInvoiceNumber = async (connection) => {
     const prefix = configObj.venta_prefijo || "FAC-"
     const invoiceNumber = `${prefix}${nextNumber.toString().padStart(6, "0")}`
 
-    // Actualizar el siguiente número
     const [updateResult] = await connection.query(
       "UPDATE configuracion SET valor = ? WHERE clave = 'venta_numero_siguiente'",
       [(nextNumber + 1).toString()],
@@ -102,7 +98,7 @@ const generateInvoiceNumber = async (connection) => {
   }
 }
 
-// Crear una nueva venta (CON VALORES HARDCODEADOS PARA CUENTA CORRIENTE)
+// Crear una nueva venta
 export const createSale = async (req, res) => {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
@@ -116,22 +112,18 @@ export const createSale = async (req, res) => {
 
     const { clienteId, productos, descuento = 0, interes = 0, observaciones = "", pagos = [], fechaVenta } = req.body
 
-    // Validar que hay productos
     if (!productos || productos.length === 0) {
       await connection.rollback()
       return res.status(400).json({ message: "Debe incluir al menos un producto" })
     }
 
-    // Validar que hay al menos un método de pago
     if (!pagos || pagos.length === 0) {
       await connection.rollback()
       return res.status(400).json({ message: "Debe incluir al menos un método de pago" })
     }
 
-    // Obtener datos de la empresa al momento de la venta
     const empresaDatos = await getCompanyDataFromConfig(connection)
 
-    // Verificar que el cliente existe y obtener info de cuenta corriente
     const [clienteData] = await connection.query(
       `SELECT 
         c.id, 
@@ -151,7 +143,6 @@ export const createSale = async (req, res) => {
 
     const cliente = clienteData[0]
 
-    // Verificar stock y calcular subtotal
     let subtotal = 0
     const productosValidados = []
 
@@ -196,7 +187,6 @@ export const createSale = async (req, res) => {
     const interesNum = Number.parseFloat(interes)
     const total = subtotal - descuentoNum + interesNum
 
-    // Validar que el total de pagos coincida con el total de la venta
     const totalPagos = pagos.reduce((sum, pago) => sum + Number.parseFloat(pago.monto), 0)
     if (Math.abs(totalPagos - total) > 0.01) {
       await connection.rollback()
@@ -205,12 +195,10 @@ export const createSale = async (req, res) => {
       })
     }
 
-    // Verificar si hay pago con cuenta corriente
     const pagoCuentaCorriente = pagos.find((pago) => pago.tipo === "cuenta_corriente")
     const tieneCuentaCorriente = !!pagoCuentaCorriente
 
     if (tieneCuentaCorriente) {
-      // Verificar que la funcionalidad de cuenta corriente esté activa (HARDCODEADO)
       if (!CUENTA_CORRIENTE_CONFIG.activa) {
         await connection.rollback()
         return res.status(400).json({ message: "La funcionalidad de cuenta corriente no está disponible" })
@@ -245,7 +233,6 @@ export const createSale = async (req, res) => {
       }
     }
 
-    // Generar número de factura
     const numeroFactura = await generateInvoiceNumber(connection)
 
     if (!numeroFactura) {
@@ -253,7 +240,6 @@ export const createSale = async (req, res) => {
       return res.status(500).json({ message: "Error al generar número de factura" })
     }
 
-    // Crear la venta con datos de empresa
     const [ventaResult] = await connection.query(
       `
       INSERT INTO ventas (
@@ -273,15 +259,13 @@ export const createSale = async (req, res) => {
         total,
         observaciones,
         tieneCuentaCorriente,
-        JSON.stringify(empresaDatos), // Guardar datos de empresa como JSON
+        JSON.stringify(empresaDatos),
       ],
     )
 
     const ventaId = ventaResult.insertId
 
-    // Insertar detalles de la venta y actualizar stock
     for (const item of productosValidados) {
-      // Asegurarse de que discount_percentage sea un número
       const discountPercentage = Number.parseFloat(item.discount_percentage || 0)
 
       await connection.query(
@@ -304,7 +288,6 @@ export const createSale = async (req, res) => {
       )
     }
 
-    // Procesar pagos
     let movimientoCuentaId = null
 
     for (const pago of pagos) {
@@ -368,7 +351,7 @@ export const createSale = async (req, res) => {
         total,
         tieneCuentaCorriente,
         movimientoCuentaId,
-        empresaDatos, // Incluir datos de empresa en la respuesta
+        empresaDatos,
       },
     })
   } catch (error) {
@@ -383,7 +366,7 @@ export const createSale = async (req, res) => {
   }
 }
 
-// Obtener una venta por ID incluyendo datos de empresa (SIN CAMBIOS)
+// Obtener una venta por ID incluyendo datos de empresa
 export const getSaleById = async (req, res) => {
   try {
     const { id } = req.params
@@ -412,14 +395,12 @@ export const getSaleById = async (req, res) => {
 
     const sale = sales[0]
 
-    // Parsear datos de empresa desde JSON
     let empresaDatos = null
     if (sale.empresa_datos) {
       try {
         empresaDatos = JSON.parse(sale.empresa_datos)
       } catch (error) {
         console.error("Error al parsear datos de empresa:", error)
-        // Si hay error, obtener datos actuales de configuración como fallback
         const connection = await pool.getConnection()
         try {
           empresaDatos = await getCompanyDataFromConfig(connection)
@@ -428,7 +409,6 @@ export const getSaleById = async (req, res) => {
         }
       }
     } else {
-      // Si no hay datos guardados, obtener datos actuales de configuración
       const connection = await pool.getConnection()
       try {
         empresaDatos = await getCompanyDataFromConfig(connection)
@@ -470,7 +450,7 @@ export const getSaleById = async (req, res) => {
       fecha_venta: sale.fecha_venta.toISOString().split("T")[0],
       fecha_creacion: sale.fecha_creacion.toISOString(),
       fecha_actualizacion: sale.fecha_actualizacion.toISOString(),
-      empresa_datos: empresaDatos, // Incluir datos de empresa
+      empresa_datos: empresaDatos,
       detalles: details.map((detail) => ({
         ...detail,
         fecha_creacion: detail.fecha_creacion.toISOString(),
@@ -488,7 +468,240 @@ export const getSaleById = async (req, res) => {
   }
 }
 
-// Anular venta (SIN CAMBIOS SIGNIFICATIVOS)
+// ACTUALIZADO: Obtener ventas para reportes CON PAGINACIÓN
+export const getSales = async (req, res) => {
+  try {
+    console.log("getSales called with query:", req.query)
+
+    const {
+      fechaInicio = "",
+      fechaFin = "",
+      cliente = "",
+      numeroFactura = "",
+      estado = "todos",
+      tipoPago = "todos",
+      limit = 10,
+      offset = 0,
+    } = req.query
+
+    let baseQuery = `
+      FROM ventas v
+      JOIN clientes c ON v.cliente_id = c.id
+      JOIN usuarios u ON v.usuario_id = u.id
+      WHERE 1=1
+    `
+
+    const queryParams = []
+
+    if (fechaInicio) {
+      baseQuery += ` AND DATE(v.fecha_venta) >= ?`
+      queryParams.push(fechaInicio)
+    }
+
+    if (fechaFin) {
+      baseQuery += ` AND DATE(v.fecha_venta) <= ?`
+      queryParams.push(fechaFin)
+    }
+
+    if (cliente) {
+      baseQuery += ` AND c.nombre LIKE ?`
+      queryParams.push(`%${cliente}%`)
+    }
+
+    if (numeroFactura) {
+      baseQuery += ` AND v.numero_factura LIKE ?`
+      queryParams.push(`%${numeroFactura}%`)
+    }
+
+    if (estado !== "todos") {
+      baseQuery += ` AND v.estado = ?`
+      queryParams.push(estado)
+    }
+
+    // Filtro por tipo de pago
+    if (tipoPago !== "todos") {
+      if (tipoPago === "varios") {
+        baseQuery += ` AND v.id IN (
+          SELECT venta_id FROM venta_pagos 
+          GROUP BY venta_id 
+          HAVING COUNT(DISTINCT tipo_pago) > 1
+        )`
+      } else {
+        baseQuery += ` AND v.id IN (
+          SELECT venta_id FROM venta_pagos 
+          WHERE tipo_pago = ?
+        )`
+        queryParams.push(tipoPago)
+      }
+    }
+
+    // Consulta de conteo
+    const countQuery = `SELECT COUNT(*) as total ${baseQuery}`
+    const [[{ total }]] = await pool.query(countQuery, queryParams)
+
+    // Consulta de datos con paginación
+    const dataQuery = `
+      SELECT 
+        v.id,
+        v.numero_factura,
+        v.fecha_venta,
+        v.subtotal,
+        v.descuento,
+        v.interes,
+        v.total,
+        v.estado,
+        v.observaciones,
+        v.tiene_cuenta_corriente,
+        v.fecha_creacion,
+        c.nombre as cliente_nombre,
+        u.nombre as usuario_nombre
+      ${baseQuery}
+      ORDER BY v.fecha_venta DESC, v.id DESC
+      LIMIT ? OFFSET ?
+    `
+    const finalDataParams = [...queryParams, Number.parseInt(limit), Number.parseInt(offset)]
+    const [sales] = await pool.query(dataQuery, finalDataParams)
+
+    console.log("Found sales:", sales.length)
+
+    const salesWithISODate = sales.map((sale) => ({
+      ...sale,
+      fecha_venta: sale.fecha_venta.toISOString().split("T")[0],
+      fecha_creacion: sale.fecha_creacion.toISOString(),
+    }))
+
+    console.log("Returning sales data with pagination")
+    res.status(200).json({
+      success: true,
+      data: salesWithISODate,
+      pagination: {
+        totalItems: total,
+        totalPages: Math.ceil(total / limit),
+        currentPage: Math.floor(offset / limit) + 1,
+        itemsPerPage: Number.parseInt(limit),
+      },
+    })
+  } catch (error) {
+    console.error("Error al obtener ventas:", error)
+    res.status(500).json({
+      success: false,
+      message: "Error al obtener ventas",
+      error: error.message,
+    })
+  }
+}
+
+// CORREGIDO: Obtener estadísticas de ventas
+export const getSalesStats = async (req, res) => {
+  try {
+    console.log("getSalesStats called with query:", req.query)
+
+    const { fechaInicio = "", fechaFin = "" } = req.query
+
+    let whereClause = "WHERE v.estado = 'completada'"
+    const queryParams = []
+
+    if (fechaInicio) {
+      whereClause += " AND DATE(v.fecha_venta) >= ?"
+      queryParams.push(fechaInicio)
+    }
+
+    if (fechaFin) {
+      whereClause += " AND DATE(v.fecha_venta) <= ?"
+      queryParams.push(fechaFin)
+    }
+
+    console.log("Stats where clause:", whereClause)
+    console.log("Stats params:", queryParams)
+
+    // Estadísticas generales
+    const [generalStats] = await pool.query(
+      `
+      SELECT 
+        COUNT(*) as total_ventas,
+        SUM(v.total) as total_facturado,
+        AVG(v.total) as promedio_venta,
+        SUM(CASE WHEN v.tiene_cuenta_corriente THEN 1 ELSE 0 END) as ventas_cuenta_corriente,
+        SUM(CASE WHEN v.tiene_cuenta_corriente THEN v.total ELSE 0 END) as total_cuenta_corriente
+      FROM ventas v
+      ${whereClause}
+    `,
+      queryParams,
+    )
+
+    // Ventas por día
+    const [salesByDay] = await pool.query(
+      `
+      SELECT 
+        DATE(v.fecha_venta) as fecha,
+        COUNT(*) as cantidad_ventas,
+        SUM(v.total) as total_dia
+      FROM ventas v
+      ${whereClause}
+      GROUP BY DATE(v.fecha_venta)
+      ORDER BY fecha DESC
+      LIMIT 30
+    `,
+      queryParams,
+    )
+
+    // Top clientes
+    const [topClients] = await pool.query(
+      `
+      SELECT 
+        c.id,
+        c.nombre,
+        COUNT(v.id) as cantidad_compras,
+        SUM(v.total) as total_comprado
+      FROM ventas v
+      JOIN clientes c ON v.cliente_id = c.id
+      ${whereClause}
+      GROUP BY c.id
+      ORDER BY total_comprado DESC
+      LIMIT 10
+    `,
+      queryParams,
+    )
+
+    // Métodos de pago
+    const [paymentMethods] = await pool.query(
+      `
+      SELECT 
+        vp.tipo_pago,
+        COUNT(vp.id) as cantidad_usos,
+        SUM(vp.monto) as total_monto
+      FROM venta_pagos vp
+      JOIN ventas v ON vp.venta_id = v.id
+      ${whereClause.replace("WHERE", "WHERE")}
+      GROUP BY vp.tipo_pago
+      ORDER BY total_monto DESC
+    `,
+      queryParams,
+    )
+
+    const stats = {
+      estadisticas_generales: generalStats[0],
+      ventas_por_dia: salesByDay.map((day) => ({
+        ...day,
+        fecha: day.fecha.toISOString().split("T")[0],
+      })),
+      top_clientes: topClients,
+      metodos_pago: paymentMethods,
+    }
+
+    console.log("Returning stats:", stats)
+    res.status(200).json(stats)
+  } catch (error) {
+    console.error("Error al obtener estadísticas:", error)
+    res.status(500).json({
+      success: false,
+      message: "Error al obtener estadísticas",
+      error: error.message,
+    })
+  }
+}
+
+// Anular venta
 export const cancelSale = async (req, res) => {
   const connection = await pool.getConnection()
 
@@ -607,77 +820,11 @@ export const cancelSale = async (req, res) => {
   }
 }
 
-// Obtener ventas (SIN CAMBIOS)
-export const getSales = async (req, res) => {
-  try {
-    const { fechaInicio = "", fechaFin = "", cliente = "", estado = "todos", limit = 50, offset = 0 } = req.query
-
-    let query = `
-      SELECT 
-        v.id,
-        v.numero_factura,
-        v.fecha_venta,
-        v.subtotal,
-        v.descuento,
-        v.interes,
-        v.total,
-        v.estado,
-        v.observaciones,
-        v.tiene_cuenta_corriente,
-        v.fecha_creacion,
-        c.nombre as cliente_nombre,
-        u.nombre as usuario_nombre
-      FROM ventas v
-      JOIN clientes c ON v.cliente_id = c.id
-      JOIN usuarios u ON v.usuario_id = u.id
-      WHERE 1=1
-    `
-
-    const queryParams = []
-
-    if (fechaInicio) {
-      query += ` AND DATE(v.fecha_venta) >= ?`
-      queryParams.push(fechaInicio)
-    }
-
-    if (fechaFin) {
-      query += ` AND DATE(v.fecha_venta) <= ?`
-      queryParams.push(fechaFin)
-    }
-
-    if (cliente) {
-      query += ` AND c.nombre LIKE ?`
-      queryParams.push(`%${cliente}%`)
-    }
-
-    if (estado !== "todos") {
-      query += ` AND v.estado = ?`
-      queryParams.push(estado)
-    }
-
-    query += ` ORDER BY v.fecha_venta DESC, v.id DESC LIMIT ? OFFSET ?`
-    queryParams.push(Number.parseInt(limit), Number.parseInt(offset))
-
-    const [sales] = await pool.query(query, queryParams)
-
-    const salesWithISODate = sales.map((sale) => ({
-      ...sale,
-      fecha_venta: sale.fecha_venta.toISOString().split("T")[0],
-      fecha_creacion: sale.fecha_creacion.toISOString(),
-    }))
-
-    res.status(200).json(salesWithISODate)
-  } catch (error) {
-    console.error("Error al obtener ventas:", error)
-    res.status(500).json({ message: "Error al obtener ventas" })
-  }
-}
-
-// Obtener ventas por cliente (SIN CAMBIOS)
+// Obtener ventas por cliente CON PAGINACIÓN
 export const getSalesByClient = async (req, res) => {
   try {
     const { clientId } = req.params
-    const { limit = 50, offset = 0, estado = "todos" } = req.query
+    const { limit = 10, offset = 0, estado = "todos" } = req.query
 
     const [client] = await pool.query("SELECT id, nombre FROM clientes WHERE id = ? AND activo = TRUE", [clientId])
 
@@ -685,20 +832,7 @@ export const getSalesByClient = async (req, res) => {
       return res.status(404).json({ message: "Cliente no encontrado" })
     }
 
-    let query = `
-      SELECT 
-        v.id,
-        v.numero_factura,
-        v.fecha_venta,
-        v.subtotal,
-        v.descuento,
-        v.interes,
-        v.total,
-        v.estado,
-        v.observaciones,
-        v.tiene_cuenta_corriente,
-        v.fecha_creacion,
-        u.nombre as usuario_nombre
+    let baseQuery = `
       FROM ventas v
       JOIN usuarios u ON v.usuario_id = u.id
       WHERE v.cliente_id = ?
@@ -707,14 +841,35 @@ export const getSalesByClient = async (req, res) => {
     const queryParams = [clientId]
 
     if (estado !== "todos") {
-      query += ` AND v.estado = ?`
+      baseQuery += ` AND v.estado = ?`
       queryParams.push(estado)
     }
 
-    query += ` ORDER BY v.fecha_venta DESC, v.id DESC LIMIT ? OFFSET ?`
-    queryParams.push(Number.parseInt(limit), Number.parseInt(offset))
+    // Consulta de conteo
+    const countQuery = `SELECT COUNT(*) as total ${baseQuery}`
+    const [[{ total }]] = await pool.query(countQuery, queryParams)
 
-    const [sales] = await pool.query(query, queryParams)
+    // Consulta de datos con paginación
+    const dataQuery = `
+      SELECT 
+        v.id,
+        v.numero_factura,
+        v.fecha_venta,
+        v.subtotal,
+        v.descuento,
+        v.interes,
+        v.total,
+        v.estado,
+        v.observaciones,
+        v.tiene_cuenta_corriente,
+        v.fecha_creacion,
+        u.nombre as usuario_nombre
+      ${baseQuery}
+      ORDER BY v.fecha_venta DESC, v.id DESC
+      LIMIT ? OFFSET ?
+    `
+    const finalDataParams = [...queryParams, Number.parseInt(limit), Number.parseInt(offset)]
+    const [sales] = await pool.query(dataQuery, finalDataParams)
 
     const salesWithISODate = sales.map((sale) => ({
       ...sale,
@@ -722,128 +877,31 @@ export const getSalesByClient = async (req, res) => {
       fecha_creacion: sale.fecha_creacion.toISOString(),
     }))
 
-    const [totalCount] = await pool.query(
-      `SELECT COUNT(*) as total FROM ventas WHERE cliente_id = ? ${estado !== "todos" ? "AND estado = ?" : ""}`,
-      estado !== "todos" ? [clientId, estado] : [clientId],
-    )
-
     res.status(200).json({
+      success: true,
       cliente: client[0],
-      ventas: salesWithISODate,
-      total: totalCount[0].total,
+      data: salesWithISODate,
+      pagination: {
+        totalItems: total,
+        totalPages: Math.ceil(total / limit),
+        currentPage: Math.floor(offset / limit) + 1,
+        itemsPerPage: Number.parseInt(limit),
+      },
     })
   } catch (error) {
     console.error("Error al obtener ventas del cliente:", error)
-    res.status(500).json({ message: "Error al obtener ventas del cliente" })
+    res.status(500).json({
+      success: false,
+      message: "Error al obtener ventas del cliente",
+    })
   }
 }
 
-// Obtener estadísticas de ventas (SIN CAMBIOS)
-export const getSalesStats = async (req, res) => {
-  try {
-    const { fechaInicio = "", fechaFin = "" } = req.query
-
-    let whereClause = "WHERE v.estado = 'completada'"
-    const queryParams = []
-
-    if (fechaInicio) {
-      whereClause += " AND DATE(v.fecha_venta) >= ?"
-      queryParams.push(fechaInicio)
-    }
-
-    if (fechaFin) {
-      whereClause += " AND DATE(v.fecha_venta) <= ?"
-      queryParams.push(fechaFin)
-    }
-
-    // Estadísticas generales
-    const [generalStats] = await pool.query(
-      `
-      SELECT 
-        COUNT(*) as total_ventas,
-        SUM(v.total) as total_facturado,
-        AVG(v.total) as promedio_venta,
-        SUM(CASE WHEN v.tiene_cuenta_corriente THEN 1 ELSE 0 END) as ventas_cuenta_corriente,
-        SUM(CASE WHEN v.tiene_cuenta_corriente THEN v.total ELSE 0 END) as total_cuenta_corriente
-      FROM ventas v
-      ${whereClause}
-    `,
-      queryParams,
-    )
-
-    // Ventas por día
-    const [salesByDay] = await pool.query(
-      `
-      SELECT 
-        DATE(v.fecha_venta) as fecha,
-        COUNT(*) as cantidad_ventas,
-        SUM(v.total) as total_dia
-      FROM ventas v
-      ${whereClause}
-      GROUP BY DATE(v.fecha_venta)
-      ORDER BY fecha DESC
-      LIMIT 30
-    `,
-      queryParams,
-    )
-
-    // Top clientes
-    const [topClients] = await pool.query(
-      `
-      SELECT 
-        c.id,
-        c.nombre,
-        COUNT(v.id) as cantidad_compras,
-        SUM(v.total) as total_comprado
-      FROM ventas v
-      JOIN clientes c ON v.cliente_id = c.id
-      ${whereClause}
-      GROUP BY c.id
-      ORDER BY total_comprado DESC
-      LIMIT 10
-    `,
-      queryParams,
-    )
-
-    // Métodos de pago
-    const [paymentMethods] = await pool.query(
-      `
-      SELECT 
-        vp.tipo_pago,
-        COUNT(vp.id) as cantidad_usos,
-        SUM(vp.monto) as total_monto
-      FROM venta_pagos vp
-      JOIN ventas v ON vp.venta_id = v.id
-      ${whereClause.replace("WHERE", "WHERE")}
-      GROUP BY vp.tipo_pago
-      ORDER BY total_monto DESC
-    `,
-      queryParams,
-    )
-
-    const stats = {
-      estadisticas_generales: generalStats[0],
-      ventas_por_dia: salesByDay.map((day) => ({
-        ...day,
-        fecha: day.fecha.toISOString().split("T")[0],
-      })),
-      top_clientes: topClients,
-      metodos_pago: paymentMethods,
-    }
-
-    res.status(200).json(stats)
-  } catch (error) {
-    console.error("Error al obtener estadísticas:", error)
-    res.status(500).json({ message: "Error al obtener estadísticas" })
-  }
-}
-
-// Obtener resumen del día (SIN CAMBIOS)
+// Obtener resumen del día
 export const getTodaySummary = async (req, res) => {
   try {
     const today = new Date().toISOString().split("T")[0]
 
-    // Resumen general del día
     const [summary] = await pool.query(
       `
       SELECT 
@@ -857,7 +915,6 @@ export const getTodaySummary = async (req, res) => {
       [today],
     )
 
-    // Métodos de pago del día
     const [paymentMethods] = await pool.query(
       `
       SELECT 
@@ -873,7 +930,6 @@ export const getTodaySummary = async (req, res) => {
       [today],
     )
 
-    // Productos más vendidos del día
     const [topProducts] = await pool.query(
       `
       SELECT 
@@ -909,7 +965,7 @@ export const getTodaySummary = async (req, res) => {
 // Alias para compatibilidad con rutas existentes
 export const getDailySummary = getTodaySummary
 
-// Actualizar venta (SIN CAMBIOS)
+// Actualizar venta
 export const updateSale = async (req, res) => {
   try {
     const { id } = req.params
