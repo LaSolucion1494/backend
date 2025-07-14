@@ -1,23 +1,20 @@
 import mysql from 'mysql2/promise';
-import { DB_HOST, DB_USER, DB_PASSWORD, DB_NAME } from './config.js';
+import { MYSQL_PUBLIC_URL } from './config.js';
 
 let pool;
 
 try {
-    // Crear un pool de conexiones
-    pool = mysql.createPool({
-        host: DB_HOST,         
-        user: DB_USER,       
-        password: DB_PASSWORD, 
-        database: DB_NAME,      
+     // Crear un pool de conexiones
+     pool = mysql.createPool({
+        uri: MYSQL_PUBLIC_URL,
         waitForConnections: true,
         connectionLimit: 10,
         queueLimit: 0,
-        timezone: 'Z',
+        timezone: 'Z', 
     });
 
-    // Probar la conexión
-    const testConnection = async () => {
+     // Probar la conexión
+     const testConnection = async () => {
         try {
             const connection = await pool.getConnection();
             console.log('Conexión a la base de datos establecida correctamente');
