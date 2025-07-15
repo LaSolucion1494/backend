@@ -191,3 +191,32 @@ export const deleteSupplier = async (req, res) => {
     res.status(500).json({ message: "Error al eliminar proveedor" })
   }
 }
+
+// Buscar proveedor por nombre, CUIT, teléfono o dirección (para autocompletado)
+export const searchSuppliers = async (req, res) => {
+  try {
+    const { term } = req.query
+
+    if (!term || term.length < 2) {
+      return res.status(200).json([])
+    }
+
+    const [suppliers] = await pool.query(
+      `
+      SELECT 
+        id, cuit, nombre, telefono, direccion
+      FROM proveedores
+      WHERE (nombre LIKE ? OR cuit LIKE ? OR telefono LIKE ? OR direccion LIKE ?)
+      AND activo = TRUE
+      ORDER BY nombre ASC
+      LIMIT 10
+      `,
+      [`%${term}%`, `%${term}%`, `%${term}%`, `%${term}%`],
+    )
+
+    res.status(200).json(suppliers)
+  } catch (error) {
+    console.error("Error al buscar proveedores:", error)
+    res.status(500).json({ message: "Error al buscar proveedores" })
+  }
+}

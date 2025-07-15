@@ -1,6 +1,6 @@
 import { Router } from "express"
 import { check } from "express-validator"
-import { getSuppliers, createSupplier, updateSupplier, deleteSupplier } from "../controllers/suppliers.controller.js"
+import { getSuppliers, createSupplier, updateSupplier, deleteSupplier, searchSuppliers } from "../controllers/suppliers.controller.js"
 import { verifyToken } from "../middlewares/verifyToken.js"
 
 const router = Router()
@@ -15,6 +15,7 @@ const validateSupplierSchema = [
 
 // Rutas
 router.get("/", verifyToken(), getSuppliers)
+router.get("/search", verifyToken(), searchSuppliers) // Nueva ruta para la búsqueda
 router.post("/", verifyToken(["admin"]), validateSupplierSchema, createSupplier)
 router.put("/:id", verifyToken(["admin"]), validateSupplierSchema, updateSupplier)
 router.delete("/:id", verifyToken(["admin"]), deleteSupplier)
