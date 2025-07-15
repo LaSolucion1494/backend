@@ -1,4 +1,4 @@
-// sales.controller.js - VERSIÓN CORREGIDA PARA REPORTES CON PAGINACIÓN
+// sales.controller.js - VERSIÓN CORREGIDA PARA REPORTES CON PAGINACIÓN Y VENTAS PENDIENTES
 import pool from "../db.js"
 import { validationResult } from "express-validator"
 
@@ -159,12 +159,8 @@ export const createSale = async (req, res) => {
 
       const prod = producto[0]
 
-      if (prod.stock < item.cantidad) {
-        await connection.rollback()
-        return res.status(400).json({
-          message: `Stock insuficiente para ${prod.nombre}. Stock disponible: ${prod.stock}`,
-        })
-      }
+      // NO SE VALIDA STOCK NI SE DECREMENTA EN ESTE PUNTO. LA VENTA SE CREA COMO PENDIENTE.
+      // El stock se decrementará al momento de la entrega.
 
       const precioUnitario = Number.parseFloat(item.precioUnitario || prod.precio_venta)
       const cantidad = Number.parseInt(item.cantidad)
@@ -240,13 +236,15 @@ export const createSale = async (req, res) => {
       return res.status(500).json({ message: "Error al generar número de factura" })
     }
 
+    // La venta se crea siempre como 'pendiente' inicialmente.
+    // El estado cambiará a 'completada' una vez que todos los productos sean entregados.
     const [ventaResult] = await connection.query(
       `
       INSERT INTO ventas (
         numero_factura, cliente_id, usuario_id, fecha_venta,
         subtotal, descuento, interes, total, observaciones,
-        tiene_cuenta_corriente, empresa_datos
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        tiene_cuenta_corriente, empresa_datos, estado
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pendiente')
     `,
       [
         numeroFactura,
@@ -269,23 +267,12 @@ export const createSale = async (req, res) => {
       const discountPercentage = Number.parseFloat(item.discount_percentage || 0)
 
       await connection.query(
-        "INSERT INTO detalles_ventas (venta_id, producto_id, cantidad, precio_unitario, subtotal, discount_percentage) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO detalles_ventas (venta_id, producto_id, cantidad, precio_unitario, subtotal, discount_percentage, cantidad_entregada) VALUES (?, ?, ?, ?, ?, ?, 0)",
         [ventaId, item.productoId, item.cantidad, item.precioUnitario, item.subtotalItem, discountPercentage],
       )
 
-      const [stockActual] = await connection.query("SELECT stock FROM productos WHERE id = ?", [item.productoId])
-      const nuevoStock = stockActual[0].stock - item.cantidad
-
-      await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [nuevoStock, item.productoId])
-
-      await connection.query(
-        `
-        INSERT INTO movimientos_stock (
-          producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
-        ) VALUES (?, ?, 'salida', ?, ?, ?, ?)
-      `,
-        [item.productoId, req.user.id, item.cantidad, stockActual[0].stock, nuevoStock, `Venta ${numeroFactura}`],
-      )
+      // NO SE DECREMENTA EL STOCK NI SE REGISTRA MOVIMIENTO DE SALIDA EN ESTE PUNTO.
+      // Esto se hará al momento de la entrega.
     }
 
     let movimientoCuentaId = null
@@ -344,7 +331,7 @@ export const createSale = async (req, res) => {
     await connection.commit()
 
     res.status(201).json({
-      message: "Venta creada exitosamente",
+      message: "Venta creada exitosamente como pendiente",
       data: {
         id: ventaId,
         numeroFactura: numeroFactura,
@@ -352,6 +339,7 @@ export const createSale = async (req, res) => {
         tieneCuentaCorriente,
         movimientoCuentaId,
         empresaDatos,
+        estado: "pendiente", // Confirmar el estado inicial
       },
     })
   } catch (error) {
@@ -422,7 +410,9 @@ export const getSaleById = async (req, res) => {
       SELECT 
         dv.*,
         p.nombre as producto_nombre,
-        p.codigo as producto_codigo
+        p.codigo as producto_codigo,
+        p.marca as producto_marca,
+        p.stock as producto_stock_actual -- Incluir stock actual del producto
       FROM detalles_ventas dv
       JOIN productos p ON dv.producto_id = p.id
       WHERE dv.venta_id = ?
@@ -598,7 +588,7 @@ export const getSalesStats = async (req, res) => {
 
     const { fechaInicio = "", fechaFin = "" } = req.query
 
-    let whereClause = "WHERE v.estado = 'completada'"
+    let whereClause = "WHERE 1=1" // Cambiado para incluir todos los estados por defecto
     const queryParams = []
 
     if (fechaInicio) {
@@ -619,23 +609,26 @@ export const getSalesStats = async (req, res) => {
       `
       SELECT 
         COUNT(*) as total_ventas,
-        SUM(v.total) as total_facturado,
-        AVG(v.total) as promedio_venta,
-        SUM(CASE WHEN v.tiene_cuenta_corriente THEN 1 ELSE 0 END) as ventas_cuenta_corriente,
-        SUM(CASE WHEN v.tiene_cuenta_corriente THEN v.total ELSE 0 END) as total_cuenta_corriente
+        SUM(CASE WHEN v.estado = 'completada' THEN v.total ELSE 0 END) as total_facturado,
+        AVG(CASE WHEN v.estado = 'completada' THEN v.total ELSE NULL END) as promedio_venta,
+        SUM(CASE WHEN v.tiene_cuenta_corriente AND v.estado = 'completada' THEN 1 ELSE 0 END) as ventas_cuenta_corriente,
+        SUM(CASE WHEN v.tiene_cuenta_corriente AND v.estado = 'completada' THEN v.total ELSE 0 END) as total_cuenta_corriente,
+        SUM(CASE WHEN v.estado = 'completada' THEN 1 ELSE 0 END) as ventas_completadas,
+        SUM(CASE WHEN v.estado = 'anulada' THEN 1 ELSE 0 END) as ventas_anuladas,
+        SUM(CASE WHEN v.estado = 'pendiente' THEN 1 ELSE 0 END) as ventas_pendientes
       FROM ventas v
       ${whereClause}
     `,
       queryParams,
     )
 
-    // Ventas por día
+    // Ventas por día (solo completadas para facturado)
     const [salesByDay] = await pool.query(
       `
       SELECT 
         DATE(v.fecha_venta) as fecha,
         COUNT(*) as cantidad_ventas,
-        SUM(v.total) as total_dia
+        SUM(CASE WHEN v.estado = 'completada' THEN v.total ELSE 0 END) as total_dia
       FROM ventas v
       ${whereClause}
       GROUP BY DATE(v.fecha_venta)
@@ -645,7 +638,7 @@ export const getSalesStats = async (req, res) => {
       queryParams,
     )
 
-    // Top clientes
+    // Top clientes (solo ventas completadas)
     const [topClients] = await pool.query(
       `
       SELECT 
@@ -655,7 +648,7 @@ export const getSalesStats = async (req, res) => {
         SUM(v.total) as total_comprado
       FROM ventas v
       JOIN clientes c ON v.cliente_id = c.id
-      ${whereClause}
+      ${whereClause} AND v.estado = 'completada'
       GROUP BY c.id
       ORDER BY total_comprado DESC
       LIMIT 10
@@ -663,7 +656,7 @@ export const getSalesStats = async (req, res) => {
       queryParams,
     )
 
-    // Métodos de pago
+    // Métodos de pago (solo ventas completadas)
     const [paymentMethods] = await pool.query(
       `
       SELECT 
@@ -672,7 +665,7 @@ export const getSalesStats = async (req, res) => {
         SUM(vp.monto) as total_monto
       FROM venta_pagos vp
       JOIN ventas v ON vp.venta_id = v.id
-      ${whereClause.replace("WHERE", "WHERE")}
+      ${whereClause.replace("WHERE", "WHERE")} AND v.estado = 'completada'
       GROUP BY vp.tipo_pago
       ORDER BY total_monto DESC
     `,
@@ -711,7 +704,7 @@ export const cancelSale = async (req, res) => {
     const { id } = req.params
     const { motivo = "" } = req.body
 
-    const [sales] = await connection.query("SELECT * FROM ventas WHERE id = ? AND estado = 'completada'", [id])
+    const [sales] = await connection.query("SELECT * FROM ventas WHERE id = ? AND estado != 'anulada'", [id])
 
     if (sales.length === 0) {
       await connection.rollback()
@@ -720,30 +713,38 @@ export const cancelSale = async (req, res) => {
 
     const sale = sales[0]
 
-    const [details] = await connection.query("SELECT * FROM detalles_ventas WHERE venta_id = ?", [id])
+    // Solo revertir stock si la venta estaba completada
+    if (sale.estado === "completada") {
+      const [details] = await connection.query("SELECT * FROM detalles_ventas WHERE venta_id = ?", [id])
 
-    for (const detail of details) {
-      const [stockActual] = await connection.query("SELECT stock FROM productos WHERE id = ?", [detail.producto_id])
+      for (const detail of details) {
+        // Solo revertir la cantidad que fue entregada (y por lo tanto, decrementó el stock)
+        const cantidadARevertir = detail.cantidad_entregada
 
-      const nuevoStock = stockActual[0].stock + detail.cantidad
+        if (cantidadARevertir > 0) {
+          const [stockActual] = await connection.query("SELECT stock FROM productos WHERE id = ?", [detail.producto_id])
 
-      await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [nuevoStock, detail.producto_id])
+          const nuevoStock = stockActual[0].stock + cantidadARevertir
 
-      await connection.query(
-        `
-        INSERT INTO movimientos_stock (
-          producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
-        ) VALUES (?, ?, 'entrada', ?, ?, ?, ?)
-      `,
-        [
-          detail.producto_id,
-          req.user.id,
-          detail.cantidad,
-          stockActual[0].stock,
-          nuevoStock,
-          `Anulación venta ${sale.numero_factura} - ${motivo}`,
-        ],
-      )
+          await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [nuevoStock, detail.producto_id])
+
+          await connection.query(
+            `
+            INSERT INTO movimientos_stock (
+              producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
+            ) VALUES (?, ?, 'entrada', ?, ?, ?, ?)
+          `,
+            [
+              detail.producto_id,
+              req.user.id,
+              cantidadARevertir,
+              stockActual[0].stock,
+              nuevoStock,
+              `Anulación venta ${sale.numero_factura} - ${motivo} (reversión de ${cantidadARevertir} unidades entregadas)`,
+            ],
+          )
+        }
+      }
     }
 
     if (sale.tiene_cuenta_corriente) {
@@ -906,12 +907,13 @@ export const getTodaySummary = async (req, res) => {
       `
       SELECT 
         COUNT(*) as total_ventas,
-        SUM(v.total) as total_facturado,
-        SUM(CASE WHEN v.tiene_cuenta_corriente THEN 1 ELSE 0 END) as ventas_cuenta_corriente,
-        SUM(CASE WHEN v.tiene_cuenta_corriente THEN v.total ELSE 0 END) as total_cuenta_corriente
+        SUM(CASE WHEN v.estado = 'completada' THEN v.total ELSE 0 END) as total_facturado,
+        SUM(CASE WHEN v.tiene_cuenta_corriente AND v.estado = 'completada' THEN 1 ELSE 0 END) as ventas_cuenta_corriente,
+        SUM(CASE WHEN v.tiene_cuenta_corriente AND v.estado = 'completada' THEN v.total ELSE 0 END) as total_cuenta_corriente,
+        SUM(CASE WHEN v.estado = 'pendiente' THEN 1 ELSE 0 END) as ventas_pendientes_hoy
       FROM ventas v
-      WHERE DATE(v.fecha_venta) = ? AND v.estado = 'completada'
-    `,
+      WHERE DATE(v.fecha_venta) = ?
+    `, // Se incluyen ventas pendientes en el conteo total
       [today],
     )
 
@@ -936,12 +938,12 @@ export const getTodaySummary = async (req, res) => {
         p.id,
         p.nombre,
         p.codigo,
-        SUM(dv.cantidad) as cantidad_vendida,
-        SUM(dv.subtotal) as total_vendido
+        SUM(dv.cantidad_entregada) as cantidad_vendida, -- Sumar por cantidad entregada
+        SUM(dv.precio_unitario * dv.cantidad_entregada) as total_vendido -- Calcular total vendido por entregado
       FROM detalles_ventas dv
       JOIN ventas v ON dv.venta_id = v.id
       JOIN productos p ON dv.producto_id = p.id
-      WHERE DATE(v.fecha_venta) = ? AND v.estado = 'completada'
+      WHERE DATE(v.fecha_venta) = ? AND v.estado = 'completada' AND dv.cantidad_entregada > 0
       GROUP BY p.id
       ORDER BY cantidad_vendida DESC
       LIMIT 10
@@ -984,5 +986,134 @@ export const updateSale = async (req, res) => {
   } catch (error) {
     console.error("Error al actualizar venta:", error)
     res.status(500).json({ message: "Error al actualizar venta" })
+  }
+}
+
+// NUEVA FUNCIÓN: Entregar productos de una venta pendiente
+export const deliverProducts = async (req, res) => {
+  const errors = validationResult(req)
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() })
+  }
+
+  const connection = await pool.getConnection()
+
+  try {
+    await connection.beginTransaction()
+
+    const { id } = req.params // ID de la venta
+    const { deliveries } = req.body // [{ detalleId, quantity }]
+
+    const [saleResult] = await connection.query(
+      "SELECT id, numero_factura, estado FROM ventas WHERE id = ? AND estado = 'pendiente' FOR UPDATE",
+      [id],
+    )
+
+    if (saleResult.length === 0) {
+      await connection.rollback()
+      return res.status(404).json({ message: "Venta no encontrada o no está en estado pendiente" })
+    }
+
+    const sale = saleResult[0]
+    let allProductsDelivered = true
+
+    for (const delivery of deliveries) {
+      const { detalleId, quantity } = delivery
+
+      if (quantity <= 0) {
+        continue // Ignorar entregas con cantidad cero o negativa
+      }
+
+      const [detailResult] = await connection.query(
+        "SELECT id, producto_id, cantidad, cantidad_entregada FROM detalles_ventas WHERE id = ? AND venta_id = ? FOR UPDATE",
+        [detalleId, id],
+      )
+
+      if (detailResult.length === 0) {
+        await connection.rollback()
+        return res.status(404).json({ message: `Detalle de venta con ID ${detalleId} no encontrado` })
+      }
+
+      const detail = detailResult[0]
+      const remainingToDeliver = detail.cantidad - detail.cantidad_entregada
+
+      if (quantity > remainingToDeliver) {
+        await connection.rollback()
+        return res.status(400).json({
+          message: `No se puede entregar más de lo pendiente para el detalle ${detalleId}. Pendiente: ${remainingToDeliver}`,
+        })
+      }
+
+      const newCantidadEntregada = detail.cantidad_entregada + quantity
+
+      // Actualizar cantidad_entregada en detalles_ventas
+      await connection.query("UPDATE detalles_ventas SET cantidad_entregada = ? WHERE id = ?", [
+        newCantidadEntregada,
+        detalleId,
+      ])
+
+      // Decrementar stock del producto y registrar movimiento de salida
+      const [productStock] = await connection.query("SELECT stock FROM productos WHERE id = ? FOR UPDATE", [
+        detail.producto_id,
+      ])
+      const currentStock = productStock[0].stock
+      const newStock = currentStock - quantity
+
+      await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [newStock, detail.producto_id])
+
+      await connection.query(
+        `
+        INSERT INTO movimientos_stock (
+          producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
+        ) VALUES (?, ?, 'salida', ?, ?, ?, ?)
+      `,
+        [
+          detail.producto_id,
+          req.user.id,
+          quantity,
+          currentStock,
+          newStock,
+          `Entrega de venta pendiente ${sale.numero_factura} - Detalle ${detalleId}`,
+        ],
+      )
+
+      if (newCantidadEntregada < detail.cantidad) {
+        allProductsDelivered = false
+      }
+    }
+
+    // Verificar si todos los productos de la venta han sido entregados
+    const [allDetails] = await connection.query(
+      "SELECT cantidad, cantidad_entregada FROM detalles_ventas WHERE venta_id = ?",
+      [id],
+    )
+
+    const finalAllProductsDelivered = allDetails.every((d) => d.cantidad_entregada >= d.cantidad)
+
+    if (finalAllProductsDelivered) {
+      await connection.query("UPDATE ventas SET estado = 'completada' WHERE id = ?", [id])
+    } else {
+      allProductsDelivered = false // Asegurar que la bandera sea correcta si no todos fueron entregados
+    }
+
+    await connection.commit()
+
+    res.status(200).json({
+      message: finalAllProductsDelivered
+        ? "Venta completada y productos entregados exitosamente"
+        : "Productos entregados parcialmente. Venta sigue pendiente.",
+      data: {
+        saleId: id,
+        numeroFactura: sale.numero_factura,
+        newStatus: finalAllProductsDelivered ? "completada" : "pendiente",
+        allProductsDelivered: finalAllProductsDelivered,
+      },
+    })
+  } catch (error) {
+    await connection.rollback()
+    console.error("Error al entregar productos:", error)
+    res.status(500).json({ message: error.message || "Error al entregar productos" })
+  } finally {
+    connection.release()
   }
 }

@@ -10,6 +10,7 @@ import {
   getSalesStats,
   getDailySummary,
   updateSale,
+  deliverProducts, // Importar la nueva función
 } from "../controllers/sales.controller.js"
 import { verifyToken } from "../middlewares/verifyToken.js"
 
@@ -47,6 +48,15 @@ const validateCancelSaleSchema = [
     .withMessage("El motivo de anulación es obligatorio y no puede exceder 200 caracteres"),
 ]
 
+// NUEVO: Validaciones para entregar productos
+const validateDeliverProductsSchema = [
+  check("deliveries").isArray({ min: 1 }).withMessage("Debe especificar al menos un producto para entregar"),
+  check("deliveries.*.detalleId").isInt({ min: 1 }).withMessage("ID de detalle de venta inválido"),
+  check("deliveries.*.quantity")
+    .isInt({ min: 1 })
+    .withMessage("La cantidad a entregar debe ser un número entero positivo"),
+]
+
 // Rutas de consulta (requieren autenticación básica)
 router.get("/", verifyToken(), getSales)
 router.get("/stats", verifyToken(), getSalesStats)
@@ -61,5 +71,6 @@ router.put("/:id", verifyToken(), validateUpdateSaleSchema, updateSale)
 
 // Rutas administrativas (requieren permisos de admin)
 router.patch("/:id/cancel", verifyToken(["admin"]), validateCancelSaleSchema, cancelSale)
+router.patch("/:id/deliver", verifyToken(["admin", "empleado"]), validateDeliverProductsSchema, deliverProducts) // Nueva ruta para entregar productos
 
 export default router
