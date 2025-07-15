@@ -418,7 +418,7 @@ export const searchClients = async (req, res) => {
     const [clients] = await pool.query(
       `
       SELECT 
-        c.id, c.nombre, c.telefono, c.email, c.cuit, c.tiene_cuenta_corriente,
+        c.id, c.nombre, c.telefono, c.email, c.cuit, c.direccion, c.tiene_cuenta_corriente,
         c.limite_credito, c.saldo_cuenta_corriente,
         CASE 
           WHEN c.limite_credito IS NULL THEN 999999999
@@ -428,7 +428,7 @@ export const searchClients = async (req, res) => {
       WHERE (c.nombre LIKE ? OR c.telefono LIKE ? OR c.email LIKE ? OR c.cuit LIKE ?)
       AND c.activo = TRUE
       ORDER BY c.nombre ASC
-      LIMIT 10
+      LIMIT 50
       `,
       [`%${term}%`, `%${term}%`, `%${term}%`, `%${term}%`],
     )
@@ -445,6 +445,7 @@ export const searchClients = async (req, res) => {
     res.status(500).json({ message: "Error al buscar clientes" })
   }
 }
+
 
 // FUNCIONES PARA CUENTA CORRIENTE ACTUALIZADAS
 
