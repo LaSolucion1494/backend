@@ -1,4 +1,4 @@
-// presupuestos.controller.js - ACTUALIZADO PARA FUNCIONAR COMO VENTA SIN FACTURA
+// presupuestos.controller.js - CORREGIDO
 import pool from "../db.js"
 import { validationResult } from "express-validator"
 
@@ -192,7 +192,7 @@ export const createPresupuesto = async (req, res) => {
       const discountPercentage = Number.parseFloat(item.discount_percentage || 0)
 
       // ACTUALIZAR STOCK (IGUAL QUE EN VENTAS)
-      const newStock = stock_disponible - cantidad_solicitada
+      const newStock = stock_disponible - cantidad_entregada_inicial
       await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [newStock, item.productoId])
 
       // REGISTRAR MOVIMIENTO DE STOCK
@@ -278,8 +278,8 @@ export const createPresupuesto = async (req, res) => {
       }
     }
 
-    // Determinar el estado inicial
-    const initialStatus = shouldBePending ? "pendiente" : "completada"
+    // Determinar el estado inicial - CORREGIDO
+    const initialStatus = shouldBePending ? "pendiente" : "completado"
 
     const [presupuestoResult] = await connection.query(
       `
@@ -612,7 +612,7 @@ export const getPresupuestos = async (req, res) => {
   }
 }
 
-// Anular presupuesto (IGUAL QUE ANULAR VENTA)
+// Anular presupuesto (CORREGIDO - USA 'anulado' EN VEZ DE 'anulada')
 export const cancelPresupuesto = async (req, res) => {
   const connection = await pool.getConnection()
 
@@ -622,6 +622,7 @@ export const cancelPresupuesto = async (req, res) => {
     const { id } = req.params
     const { motivo = "" } = req.body
 
+    // CORREGIDO: Verificar que no esté anulado (usar 'anulado')
     const [presupuestos] = await connection.query("SELECT * FROM presupuestos WHERE id = ? AND estado != 'anulado'", [
       id,
     ])
@@ -715,6 +716,7 @@ export const cancelPresupuesto = async (req, res) => {
       }
     }
 
+    // CORREGIDO: Actualizar estado a 'anulado' (no 'anulada')
     await connection.query(
       "UPDATE presupuestos SET estado = 'anulado', observaciones = CONCAT(COALESCE(observaciones, ''), ' - ANULADO: ', ?) WHERE id = ?",
       [motivo, id],
@@ -804,7 +806,7 @@ export const deliverProductsPresupuesto = async (req, res) => {
         detail.producto_id,
       ])
       const currentStock = productStock[0].stock
-      const newStock = currentStock + quantity
+      const newStock = currentStock - quantity
 
       await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [newStock, detail.producto_id])
 
@@ -833,6 +835,7 @@ export const deliverProductsPresupuesto = async (req, res) => {
 
     const allProductsDelivered = allDetails.every((d) => d.cantidad_entregada >= d.cantidad)
 
+    // CORREGIDO: Usar 'completado' en vez de 'completada'
     if (allProductsDelivered && presupuesto.estado !== "completado") {
       await connection.query("UPDATE presupuestos SET estado = 'completado' WHERE id = ?", [id])
     } else if (!allProductsDelivered && presupuesto.estado !== "pendiente") {
@@ -879,6 +882,7 @@ export const getPresupuestosStats = async (req, res) => {
       queryParams.push(fechaFin)
     }
 
+    // CORREGIDO: Usar 'completado' en vez de 'completada'
     const [generalStats] = await pool.query(
       `
       SELECT 
@@ -933,12 +937,13 @@ export const updatePresupuesto = async (req, res) => {
   }
 }
 
-// Cambiar estado de presupuesto (MANTENIDO PARA COMPATIBILIDAD)
+// Cambiar estado de presupuesto (CORREGIDO)
 export const updatePresupuestoEstado = async (req, res) => {
   try {
     const { id } = req.params
     const { estado, observaciones = "" } = req.body
 
+    // CORREGIDO: Estados válidos actualizados
     const validStates = ["activo", "completado", "pendiente", "anulado"]
     if (!validStates.includes(estado)) {
       return res.status(400).json({ message: "Estado inválido" })

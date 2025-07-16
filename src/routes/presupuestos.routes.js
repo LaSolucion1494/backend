@@ -1,4 +1,4 @@
-// presupuestos.routes.js - ACTUALIZADO CON NUEVAS FUNCIONALIDADES
+// presupuestos.routes.js - CORREGIDO
 import { Router } from "express"
 import { check } from "express-validator"
 import {
@@ -56,7 +56,7 @@ const validateDeliverProductsSchema = [
     .withMessage("La cantidad a entregar debe ser un número entero positivo"),
 ]
 
-// Validaciones para actualizar estado
+// Validaciones para actualizar estado - CORREGIDO
 const validateUpdateEstadoSchema = [
   check("estado").isIn(["activo", "completado", "pendiente", "anulado"]).withMessage("Estado inválido"),
   check("observaciones").optional().isLength({ max: 200 }).withMessage("Observaciones muy largas"),
