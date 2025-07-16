@@ -15,8 +15,10 @@ import purchasesRoutes from "./routes/purchases.routes.js"
 import clientsRoutes from "./routes/clients.routes.js"
 import salesRoutes from "./routes/sales.routes.js"
 import cashClosingRoutes from "./routes/cashClosing.routes.js"
-import cuentaCorrienteRoutes from "./routes/cuentaCorriente.routes.js" // NUEVO
+import cuentaCorrienteRoutes from "./routes/cuentaCorriente.routes.js"
 import dashboardRoutes from "./routes/dashboard.routes.js"
+import presupuestosRoutes from "./routes/presupuestos.routes.js" // NUEVO: Importar rutas de presupuestos
+
 const app = express()
 
 const allowedOrigins = [
@@ -57,8 +59,9 @@ app.use("/api/purchases", purchasesRoutes)
 app.use("/api/clientes", clientsRoutes)
 app.use("/api/sales", salesRoutes)
 app.use("/api/cash-closing", cashClosingRoutes)
-app.use("/api/cuenta-corriente", cuentaCorrienteRoutes) // NUEVA RUTA
-app.use("/api/dashboard", dashboardRoutes) // NUEVA RUTA
+app.use("/api/cuenta-corriente", cuentaCorrienteRoutes)
+app.use("/api/dashboard", dashboardRoutes)
+app.use("/api/presupuestos", presupuestosRoutes) // NUEVO: Usar rutas de presupuestos
 
 // Middleware para manejar errores
 app.use((err, req, res, next) => {
