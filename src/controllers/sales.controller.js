@@ -12,13 +12,13 @@ const CUENTA_CORRIENTE_CONFIG = {
 const getCompanyDataFromConfig = async (connection) => {
   try {
     const [config] = await connection.query(`
-      SELECT clave, valor FROM configuracion 
-      WHERE clave IN (
-        'empresa_nombre', 'empresa_telefono', 'empresa_direccion', 'empresa_cuit', 
-        'empresa_email', 'empresa_condicion_iva', 'empresa_inicio_actividades',
-        'iva', 'ingresos_brutos'
-      )
-    `)
+    SELECT clave, valor FROM configuracion 
+    WHERE clave IN (
+      'empresa_nombre', 'empresa_telefono', 'empresa_direccion', 'empresa_cuit', 
+      'empresa_email', 'empresa_condicion_iva', 'empresa_inicio_actividades',
+      'iva', 'ingresos_brutos'
+    )
+  `)
 
     const configObj = {}
     config.forEach((item) => {
@@ -56,10 +56,10 @@ const getCompanyDataFromConfig = async (connection) => {
 const generateInvoiceNumber = async (connection) => {
   try {
     const [config] = await connection.query(`
-      SELECT clave, valor FROM configuracion 
-      WHERE clave IN ('venta_numero_siguiente', 'venta_prefijo')
-      FOR UPDATE
-    `)
+    SELECT clave, valor FROM configuracion 
+    WHERE clave IN ('venta_numero_siguiente', 'venta_prefijo')
+    FOR UPDATE
+  `)
 
     if (config.length === 0) {
       throw new Error("No se encontró configuración de numeración de facturas")
@@ -126,13 +126,13 @@ export const createSale = async (req, res) => {
 
     const [clienteData] = await connection.query(
       `SELECT 
-        c.id, 
-        c.nombre, 
-        c.tiene_cuenta_corriente,
-        c.limite_credito,
-        c.saldo_cuenta_corriente
-      FROM clientes c
-      WHERE c.id = ? AND c.activo = TRUE`,
+      c.id, 
+      c.nombre, 
+      c.tiene_cuenta_corriente,
+      c.limite_credito,
+      c.saldo_cuenta_corriente
+    FROM clientes c
+    WHERE c.id = ? AND c.activo = TRUE`,
       [clienteId],
     )
 
@@ -145,10 +145,11 @@ export const createSale = async (req, res) => {
 
     let subtotal = 0
     const productosValidados = []
+    let shouldBePending = false // Flag para determinar el estado inicial de la venta
 
     for (const item of productos) {
       const [producto] = await connection.query(
-        "SELECT id, nombre, stock, precio_venta FROM productos WHERE id = ? AND activo = TRUE",
+        "SELECT id, nombre, stock, precio_venta FROM productos WHERE id = ? AND activo = TRUE FOR UPDATE", // Lock product row for stock check
         [item.productoId],
       )
 
@@ -159,8 +160,10 @@ export const createSale = async (req, res) => {
 
       const prod = producto[0]
 
-      // NO SE VALIDA STOCK NI SE DECREMENTA EN ESTE PUNTO. LA VENTA SE CREA COMO PENDIENTE.
-      // El stock se decrementará al momento de la entrega.
+      // Check stock to determine initial sale status
+      if (item.cantidad > prod.stock) {
+        shouldBePending = true // Mark as pending if any product is out of stock
+      }
 
       const precioUnitario = Number.parseFloat(item.precioUnitario || prod.precio_venta)
       const cantidad = Number.parseInt(item.cantidad)
@@ -236,16 +239,17 @@ export const createSale = async (req, res) => {
       return res.status(500).json({ message: "Error al generar número de factura" })
     }
 
-    // La venta se crea siempre como 'pendiente' inicialmente.
-    // El estado cambiará a 'completada' una vez que todos los productos sean entregados.
+    // Set the initial status based on stock availability
+    const initialSaleStatus = shouldBePending ? "pendiente" : "completada"
+
     const [ventaResult] = await connection.query(
       `
-      INSERT INTO ventas (
-        numero_factura, cliente_id, usuario_id, fecha_venta,
-        subtotal, descuento, interes, total, observaciones,
-        tiene_cuenta_corriente, empresa_datos, estado
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pendiente')
-    `,
+    INSERT INTO ventas (
+      numero_factura, cliente_id, usuario_id, fecha_venta,
+      subtotal, descuento, interes, total, observaciones,
+      tiene_cuenta_corriente, empresa_datos, estado
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `,
       [
         numeroFactura,
         clienteId,
@@ -258,6 +262,7 @@ export const createSale = async (req, res) => {
         observaciones,
         tieneCuentaCorriente,
         JSON.stringify(empresaDatos),
+        initialSaleStatus, // Use the determined status
       ],
     )
 
@@ -271,8 +276,7 @@ export const createSale = async (req, res) => {
         [ventaId, item.productoId, item.cantidad, item.precioUnitario, item.subtotalItem, discountPercentage],
       )
 
-      // NO SE DECREMENTA EL STOCK NI SE REGISTRA MOVIMIENTO DE SALIDA EN ESTE PUNTO.
-      // Esto se hará al momento de la entrega.
+      // Stock decrement and movement logging still happen only on delivery
     }
 
     let movimientoCuentaId = null
@@ -293,12 +297,12 @@ export const createSale = async (req, res) => {
 
         const [movimientoResult] = await connection.query(
           `
-          INSERT INTO movimientos_cuenta_corriente (
-            cliente_id, usuario_id, tipo, concepto,
-            monto, saldo_anterior, saldo_nuevo, referencia_id, referencia_tipo,
-            numero_referencia, descripcion
-          ) VALUES (?, ?, 'debito', 'venta', ?, ?, ?, ?, 'venta', ?, ?)
-        `,
+        INSERT INTO movimientos_cuenta_corriente (
+          cliente_id, usuario_id, tipo, concepto,
+          monto, saldo_anterior, saldo_nuevo, referencia_id, referencia_tipo,
+          numero_referencia, descripcion
+        ) VALUES (?, ?, 'debito', 'venta', ?, ?, ?, ?, 'venta', ?, ?)
+      `,
           [
             clienteId,
             req.user.id,
@@ -331,7 +335,7 @@ export const createSale = async (req, res) => {
     await connection.commit()
 
     res.status(201).json({
-      message: "Venta creada exitosamente como pendiente",
+      message: `Venta creada exitosamente como ${initialSaleStatus}`,
       data: {
         id: ventaId,
         numeroFactura: numeroFactura,
@@ -339,7 +343,7 @@ export const createSale = async (req, res) => {
         tieneCuentaCorriente,
         movimientoCuentaId,
         empresaDatos,
-        estado: "pendiente", // Confirmar el estado inicial
+        estado: initialSaleStatus, // Confirmar el estado inicial
       },
     })
   } catch (error) {
@@ -361,19 +365,19 @@ export const getSaleById = async (req, res) => {
 
     const [sales] = await pool.query(
       `
-      SELECT 
-        v.*,
-        c.nombre as cliente_nombre,
-        c.telefono as cliente_telefono,
-        c.email as cliente_email,
-        c.direccion as cliente_direccion,
-        c.cuit as cliente_cuit,
-        u.nombre as usuario_nombre
-      FROM ventas v
-      JOIN clientes c ON v.cliente_id = c.id
-      JOIN usuarios u ON v.usuario_id = u.id
-      WHERE v.id = ?
-    `,
+    SELECT 
+      v.*,
+      c.nombre as cliente_nombre,
+      c.telefono as cliente_telefono,
+      c.email as cliente_email,
+      c.direccion as cliente_direccion,
+      c.cuit as cliente_cuit,
+      u.nombre as usuario_nombre
+    FROM ventas v
+    JOIN clientes c ON v.cliente_id = c.id
+    JOIN usuarios u ON v.usuario_id = u.id
+    WHERE v.id = ?
+  `,
       [id],
     )
 
@@ -407,31 +411,31 @@ export const getSaleById = async (req, res) => {
 
     const [details] = await pool.query(
       `
-      SELECT 
-        dv.*,
-        p.nombre as producto_nombre,
-        p.codigo as producto_codigo,
-        p.marca as producto_marca,
-        p.stock as producto_stock_actual -- Incluir stock actual del producto
-      FROM detalles_ventas dv
-      JOIN productos p ON dv.producto_id = p.id
-      WHERE dv.venta_id = ?
-      ORDER BY dv.id
-    `,
+    SELECT 
+      dv.*,
+      p.nombre as producto_nombre,
+      p.codigo as producto_codigo,
+      p.marca as producto_marca,
+      p.stock as producto_stock_actual -- Incluir stock actual del producto
+    FROM detalles_ventas dv
+    JOIN productos p ON dv.producto_id = p.id
+    WHERE dv.venta_id = ?
+    ORDER BY dv.id
+  `,
       [id],
     )
 
     const [payments] = await pool.query(
       `
-      SELECT 
-        vp.*,
-        mcc.numero_referencia as movimiento_numero,
-        mcc.descripcion as movimiento_descripcion
-      FROM venta_pagos vp
-      LEFT JOIN movimientos_cuenta_corriente mcc ON vp.movimiento_cuenta_id = mcc.id
-      WHERE vp.venta_id = ? 
-      ORDER BY vp.id
-    `,
+    SELECT 
+      vp.*,
+      mcc.numero_referencia as movimiento_numero,
+      mcc.descripcion as movimiento_descripcion
+    FROM venta_pagos vp
+    LEFT JOIN movimientos_cuenta_corriente mcc ON vp.movimiento_cuenta_id = mcc.id
+    WHERE vp.venta_id = ? 
+    ORDER BY vp.id
+  `,
       [id],
     )
 
@@ -475,11 +479,11 @@ export const getSales = async (req, res) => {
     } = req.query
 
     let baseQuery = `
-      FROM ventas v
-      JOIN clientes c ON v.cliente_id = c.id
-      JOIN usuarios u ON v.usuario_id = u.id
-      WHERE 1=1
-    `
+    FROM ventas v
+    JOIN clientes c ON v.cliente_id = c.id
+    JOIN usuarios u ON v.usuario_id = u.id
+    WHERE 1=1
+  `
 
     const queryParams = []
 
@@ -512,15 +516,15 @@ export const getSales = async (req, res) => {
     if (tipoPago !== "todos") {
       if (tipoPago === "varios") {
         baseQuery += ` AND v.id IN (
-          SELECT venta_id FROM venta_pagos 
-          GROUP BY venta_id 
-          HAVING COUNT(DISTINCT tipo_pago) > 1
-        )`
+        SELECT venta_id FROM venta_pagos 
+        GROUP BY venta_id 
+        HAVING COUNT(DISTINCT tipo_pago) > 1
+      )`
       } else {
         baseQuery += ` AND v.id IN (
-          SELECT venta_id FROM venta_pagos 
-          WHERE tipo_pago = ?
-        )`
+        SELECT venta_id FROM venta_pagos 
+        WHERE tipo_pago = ?
+      )`
         queryParams.push(tipoPago)
       }
     }
@@ -531,24 +535,24 @@ export const getSales = async (req, res) => {
 
     // Consulta de datos con paginación
     const dataQuery = `
-      SELECT 
-        v.id,
-        v.numero_factura,
-        v.fecha_venta,
-        v.subtotal,
-        v.descuento,
-        v.interes,
-        v.total,
-        v.estado,
-        v.observaciones,
-        v.tiene_cuenta_corriente,
-        v.fecha_creacion,
-        c.nombre as cliente_nombre,
-        u.nombre as usuario_nombre
-      ${baseQuery}
-      ORDER BY v.fecha_venta DESC, v.id DESC
-      LIMIT ? OFFSET ?
-    `
+    SELECT 
+      v.id,
+      v.numero_factura,
+      v.fecha_venta,
+      v.subtotal,
+      v.descuento,
+      v.interes,
+      v.total,
+      v.estado,
+      v.observaciones,
+      v.tiene_cuenta_corriente,
+      v.fecha_creacion,
+      c.nombre as cliente_nombre,
+      u.nombre as usuario_nombre
+    ${baseQuery}
+    ORDER BY v.fecha_venta DESC, v.id DESC
+    LIMIT ? OFFSET ?
+  `
     const finalDataParams = [...queryParams, Number.parseInt(limit), Number.parseInt(offset)]
     const [sales] = await pool.query(dataQuery, finalDataParams)
 
@@ -607,68 +611,68 @@ export const getSalesStats = async (req, res) => {
     // Estadísticas generales
     const [generalStats] = await pool.query(
       `
-      SELECT 
-        COUNT(*) as total_ventas,
-        SUM(CASE WHEN v.estado = 'completada' THEN v.total ELSE 0 END) as total_facturado,
-        AVG(CASE WHEN v.estado = 'completada' THEN v.total ELSE NULL END) as promedio_venta,
-        SUM(CASE WHEN v.tiene_cuenta_corriente AND v.estado = 'completada' THEN 1 ELSE 0 END) as ventas_cuenta_corriente,
-        SUM(CASE WHEN v.tiene_cuenta_corriente AND v.estado = 'completada' THEN v.total ELSE 0 END) as total_cuenta_corriente,
-        SUM(CASE WHEN v.estado = 'completada' THEN 1 ELSE 0 END) as ventas_completadas,
-        SUM(CASE WHEN v.estado = 'anulada' THEN 1 ELSE 0 END) as ventas_anuladas,
-        SUM(CASE WHEN v.estado = 'pendiente' THEN 1 ELSE 0 END) as ventas_pendientes
-      FROM ventas v
-      ${whereClause}
-    `,
+    SELECT 
+      COUNT(*) as total_ventas,
+      SUM(CASE WHEN v.estado = 'completada' THEN v.total ELSE 0 END) as total_facturado,
+      AVG(CASE WHEN v.estado = 'completada' THEN v.total ELSE NULL END) as promedio_venta,
+      SUM(CASE WHEN v.tiene_cuenta_corriente AND v.estado = 'completada' THEN 1 ELSE 0 END) as ventas_cuenta_corriente,
+      SUM(CASE WHEN v.tiene_cuenta_corriente AND v.estado = 'completada' THEN v.total ELSE 0 END) as total_cuenta_corriente,
+      SUM(CASE WHEN v.estado = 'completada' THEN 1 ELSE 0 END) as ventas_completadas,
+      SUM(CASE WHEN v.estado = 'anulada' THEN 1 ELSE 0 END) as ventas_anuladas,
+      SUM(CASE WHEN v.estado = 'pendiente' THEN 1 ELSE 0 END) as ventas_pendientes
+    FROM ventas v
+    ${whereClause}
+  `,
       queryParams,
     )
 
     // Ventas por día (solo completadas para facturado)
     const [salesByDay] = await pool.query(
       `
-      SELECT 
-        DATE(v.fecha_venta) as fecha,
-        COUNT(*) as cantidad_ventas,
-        SUM(CASE WHEN v.estado = 'completada' THEN v.total ELSE 0 END) as total_dia
-      FROM ventas v
-      ${whereClause}
-      GROUP BY DATE(v.fecha_venta)
-      ORDER BY fecha DESC
-      LIMIT 30
-    `,
+    SELECT 
+      DATE(v.fecha_venta) as fecha,
+      COUNT(*) as cantidad_ventas,
+      SUM(CASE WHEN v.estado = 'completada' THEN v.total ELSE 0 END) as total_dia
+    FROM ventas v
+    ${whereClause}
+    GROUP BY DATE(v.fecha_venta)
+    ORDER BY fecha DESC
+    LIMIT 30
+  `,
       queryParams,
     )
 
     // Top clientes (solo ventas completadas)
     const [topClients] = await pool.query(
       `
-      SELECT 
-        c.id,
-        c.nombre,
-        COUNT(v.id) as cantidad_compras,
-        SUM(v.total) as total_comprado
-      FROM ventas v
-      JOIN clientes c ON v.cliente_id = c.id
-      ${whereClause} AND v.estado = 'completada'
-      GROUP BY c.id
-      ORDER BY total_comprado DESC
-      LIMIT 10
-    `,
+    SELECT 
+      c.id,
+      c.nombre,
+      COUNT(v.id) as cantidad_compras,
+      SUM(v.total) as total_comprado
+    FROM ventas v
+    JOIN clientes c ON v.cliente_id = c.id
+    ${whereClause} AND v.estado = 'completada'
+    GROUP BY c.id
+    ORDER BY total_comprado DESC
+    LIMIT 10
+  `,
       queryParams,
     )
 
     // Métodos de pago (solo ventas completadas)
     const [paymentMethods] = await pool.query(
       `
-      SELECT 
-        vp.tipo_pago,
-        COUNT(vp.id) as cantidad_usos,
-        SUM(vp.monto) as total_monto
-      FROM venta_pagos vp
-      JOIN ventas v ON vp.venta_id = v.id
-      ${whereClause.replace("WHERE", "WHERE")} AND v.estado = 'completada'
-      GROUP BY vp.tipo_pago
-      ORDER BY total_monto DESC
-    `,
+    SELECT 
+      vp.tipo_pago,
+      COUNT(vp.id) as cantidad_usos,
+      SUM(vp.monto) as total_monto
+    FROM venta_pagos vp
+    JOIN ventas v ON vp.venta_id = v.id
+    ${whereClause.replace("WHERE", "WHERE")} AND v.estado = 'completada'
+    GROUP BY vp.tipo_pago
+    ORDER BY total_monto DESC
+  `,
       queryParams,
     )
 
@@ -730,10 +734,10 @@ export const cancelSale = async (req, res) => {
 
           await connection.query(
             `
-            INSERT INTO movimientos_stock (
-              producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
-            ) VALUES (?, ?, 'entrada', ?, ?, ?, ?)
-          `,
+          INSERT INTO movimientos_stock (
+            producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
+          ) VALUES (?, ?, 'entrada', ?, ?, ?, ?)
+        `,
             [
               detail.producto_id,
               req.user.id,
@@ -750,11 +754,11 @@ export const cancelSale = async (req, res) => {
     if (sale.tiene_cuenta_corriente) {
       const [pagosCuentaCorriente] = await connection.query(
         `
-        SELECT vp.*, mcc.* 
-        FROM venta_pagos vp
-        JOIN movimientos_cuenta_corriente mcc ON vp.movimiento_cuenta_id = mcc.id
-        WHERE vp.venta_id = ? AND vp.tipo_pago = 'cuenta_corriente'
-      `,
+      SELECT vp.*, mcc.* 
+      FROM venta_pagos vp
+      JOIN movimientos_cuenta_corriente mcc ON vp.movimiento_cuenta_id = mcc.id
+      WHERE vp.venta_id = ? AND vp.tipo_pago = 'cuenta_corriente'
+    `,
         [id],
       )
 
@@ -771,12 +775,12 @@ export const cancelSale = async (req, res) => {
 
           await connection.query(
             `
-            INSERT INTO movimientos_cuenta_corriente (
-              cliente_id, usuario_id, tipo, concepto,
-              monto, saldo_anterior, saldo_nuevo, referencia_id, referencia_tipo,
-              numero_referencia, descripcion
-            ) VALUES (?, ?, 'credito', 'nota_credito', ?, ?, ?, ?, 'anulacion_venta', ?, ?)
-          `,
+          INSERT INTO movimientos_cuenta_corriente (
+            cliente_id, usuario_id, tipo, concepto,
+            monto, saldo_anterior, saldo_nuevo, referencia_id, referencia_tipo,
+            numero_referencia, descripcion
+          ) VALUES (?, ?, 'credito', 'nota_credito', ?, ?, ?, ?, 'anulacion_venta', ?, ?)
+        `,
             [
               sale.cliente_id,
               req.user.id,
@@ -834,10 +838,10 @@ export const getSalesByClient = async (req, res) => {
     }
 
     let baseQuery = `
-      FROM ventas v
-      JOIN usuarios u ON v.usuario_id = u.id
-      WHERE v.cliente_id = ?
-    `
+    FROM ventas v
+    JOIN usuarios u ON v.usuario_id = u.id
+    WHERE v.cliente_id = ?
+  `
 
     const queryParams = [clientId]
 
@@ -852,23 +856,23 @@ export const getSalesByClient = async (req, res) => {
 
     // Consulta de datos con paginación
     const dataQuery = `
-      SELECT 
-        v.id,
-        v.numero_factura,
-        v.fecha_venta,
-        v.subtotal,
-        v.descuento,
-        v.interes,
-        v.total,
-        v.estado,
-        v.observaciones,
-        v.tiene_cuenta_corriente,
-        v.fecha_creacion,
-        u.nombre as usuario_nombre
-      ${baseQuery}
-      ORDER BY v.fecha_venta DESC, v.id DESC
-      LIMIT ? OFFSET ?
-    `
+    SELECT 
+      v.id,
+      v.numero_factura,
+      v.fecha_venta,
+      v.subtotal,
+      v.descuento,
+      v.interes,
+      v.total,
+      v.estado,
+      v.observaciones,
+      v.tiene_cuenta_corriente,
+      v.fecha_creacion,
+      u.nombre as usuario_nombre
+    ${baseQuery}
+    ORDER BY v.fecha_venta DESC, v.id DESC
+    LIMIT ? OFFSET ?
+  `
     const finalDataParams = [...queryParams, Number.parseInt(limit), Number.parseInt(offset)]
     const [sales] = await pool.query(dataQuery, finalDataParams)
 
@@ -905,49 +909,49 @@ export const getTodaySummary = async (req, res) => {
 
     const [summary] = await pool.query(
       `
-      SELECT 
-        COUNT(*) as total_ventas,
-        SUM(CASE WHEN v.estado = 'completada' THEN v.total ELSE 0 END) as total_facturado,
-        SUM(CASE WHEN v.tiene_cuenta_corriente AND v.estado = 'completada' THEN 1 ELSE 0 END) as ventas_cuenta_corriente,
-        SUM(CASE WHEN v.tiene_cuenta_corriente AND v.estado = 'completada' THEN v.total ELSE 0 END) as total_cuenta_corriente,
-        SUM(CASE WHEN v.estado = 'pendiente' THEN 1 ELSE 0 END) as ventas_pendientes_hoy
-      FROM ventas v
-      WHERE DATE(v.fecha_venta) = ?
-    `, // Se incluyen ventas pendientes en el conteo total
+    SELECT 
+      COUNT(*) as total_ventas,
+      SUM(CASE WHEN v.estado = 'completada' THEN v.total ELSE 0 END) as total_facturado,
+      SUM(CASE WHEN v.tiene_cuenta_corriente AND v.estado = 'completada' THEN 1 ELSE 0 END) as ventas_cuenta_corriente,
+      SUM(CASE WHEN v.tiene_cuenta_corriente AND v.estado = 'completada' THEN v.total ELSE 0 END) as total_cuenta_corriente,
+      SUM(CASE WHEN v.estado = 'pendiente' THEN 1 ELSE 0 END) as ventas_pendientes_hoy
+    FROM ventas v
+    WHERE DATE(v.fecha_venta) = ?
+  `, // Se incluyen ventas pendientes en el conteo total
       [today],
     )
 
     const [paymentMethods] = await pool.query(
       `
-      SELECT 
-        vp.tipo_pago,
-        COUNT(vp.id) as cantidad,
-        SUM(vp.monto) as total
-      FROM venta_pagos vp
-      JOIN ventas v ON vp.venta_id = v.id
-      WHERE DATE(v.fecha_venta) = ? AND v.estado = 'completada'
-      GROUP BY vp.tipo_pago
-      ORDER BY total DESC
-    `,
+    SELECT 
+      vp.tipo_pago,
+      COUNT(vp.id) as cantidad,
+      SUM(vp.monto) as total
+    FROM venta_pagos vp
+    JOIN ventas v ON vp.venta_id = v.id
+    WHERE DATE(v.fecha_venta) = ? AND v.estado = 'completada'
+    GROUP BY vp.tipo_pago
+    ORDER BY total DESC
+  `,
       [today],
     )
 
     const [topProducts] = await pool.query(
       `
-      SELECT 
-        p.id,
-        p.nombre,
-        p.codigo,
-        SUM(dv.cantidad_entregada) as cantidad_vendida, -- Sumar por cantidad entregada
-        SUM(dv.precio_unitario * dv.cantidad_entregada) as total_vendido -- Calcular total vendido por entregado
-      FROM detalles_ventas dv
-      JOIN ventas v ON dv.venta_id = v.id
-      JOIN productos p ON dv.producto_id = p.id
-      WHERE DATE(v.fecha_venta) = ? AND v.estado = 'completada' AND dv.cantidad_entregada > 0
-      GROUP BY p.id
-      ORDER BY cantidad_vendida DESC
-      LIMIT 10
-    `,
+    SELECT 
+      p.id,
+      p.nombre,
+      p.codigo,
+      SUM(dv.cantidad_entregada) as cantidad_vendida, -- Sumar por cantidad entregada
+      SUM(dv.precio_unitario * dv.cantidad_entregada) as total_vendido -- Calcular total vendido por entregado
+    FROM detalles_ventas dv
+    JOIN ventas v ON dv.venta_id = v.id
+    JOIN productos p ON dv.producto_id = p.id
+    WHERE DATE(v.fecha_venta) = ? AND v.estado = 'completada' AND dv.cantidad_entregada > 0
+    GROUP BY p.id
+    ORDER BY cantidad_vendida DESC
+    LIMIT 10
+  `,
       [today],
     )
 
@@ -1005,13 +1009,13 @@ export const deliverProducts = async (req, res) => {
     const { deliveries } = req.body // [{ detalleId, quantity }]
 
     const [saleResult] = await connection.query(
-      "SELECT id, numero_factura, estado FROM ventas WHERE id = ? AND estado = 'pendiente' FOR UPDATE",
+      "SELECT id, numero_factura, estado FROM ventas WHERE id = ? FOR UPDATE", // Removed `AND estado = 'pendiente'` to allow partial deliveries on already completed sales if needed, but the UI only allows it for pending.
       [id],
     )
 
     if (saleResult.length === 0) {
       await connection.rollback()
-      return res.status(404).json({ message: "Venta no encontrada o no está en estado pendiente" })
+      return res.status(404).json({ message: "Venta no encontrada" })
     }
 
     const sale = saleResult[0]
@@ -1063,17 +1067,17 @@ export const deliverProducts = async (req, res) => {
 
       await connection.query(
         `
-        INSERT INTO movimientos_stock (
-          producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
-        ) VALUES (?, ?, 'salida', ?, ?, ?, ?)
-      `,
+      INSERT INTO movimientos_stock (
+        producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
+      ) VALUES (?, ?, 'salida', ?, ?, ?, ?)
+    `,
         [
           detail.producto_id,
           req.user.id,
           quantity,
           currentStock,
           newStock,
-          `Entrega de venta pendiente ${sale.numero_factura} - Detalle ${detalleId}`,
+          `Entrega de venta ${sale.numero_factura} - Detalle ${detalleId}`, // Changed from 'pendiente' as sale might be completed
         ],
       )
 
@@ -1090,10 +1094,12 @@ export const deliverProducts = async (req, res) => {
 
     const finalAllProductsDelivered = allDetails.every((d) => d.cantidad_entregada >= d.cantidad)
 
-    if (finalAllProductsDelivered) {
+    if (finalAllProductsDelivered && sale.estado !== "completada") {
+      // Only update to 'completada' if it's not already
       await connection.query("UPDATE ventas SET estado = 'completada' WHERE id = ?", [id])
-    } else {
-      allProductsDelivered = false // Asegurar que la bandera sea correcta si no todos fueron entregados
+    } else if (!finalAllProductsDelivered && sale.estado !== "pendiente") {
+      // If not all delivered, ensure it's 'pendiente'
+      await connection.query("UPDATE ventas SET estado = 'pendiente' WHERE id = ?", [id])
     }
 
     await connection.commit()
