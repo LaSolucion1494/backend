@@ -147,6 +147,14 @@ export const createSale = async (req, res) => {
     const productsToProcess = [] // Almacena productos con su estado de stock
     let shouldBePending = false // Flag para determinar el estado inicial de la venta
 
+    // Generar número de factura antes de procesar productos para usarlo en los motivos de stock
+    const numeroFactura = await generateInvoiceNumber(connection)
+
+    if (!numeroFactura) {
+      await connection.rollback()
+      return res.status(500).json({ message: "Error al generar número de factura" })
+    }
+
     for (const item of productos) {
       const [producto] = await connection.query(
         "SELECT id, nombre, stock, precio_venta FROM productos WHERE id = ? AND activo = TRUE FOR UPDATE", // Bloquear fila para verificación de stock
@@ -159,27 +167,52 @@ export const createSale = async (req, res) => {
       }
 
       const prod = producto[0]
+      const cantidad_solicitada = Number.parseInt(item.cantidad)
+      const stock_disponible = Number.parseInt(prod.stock)
 
-      // Verificar stock para determinar el estado inicial de la venta
-      const hasEnoughStock = prod.stock >= item.cantidad
-      if (!hasEnoughStock) {
-        shouldBePending = true // Si algún producto no tiene stock, toda la venta se vuelve pendiente
+      // Determinar cuánto se puede entregar inmediatamente
+      const cantidad_entregada_inicial = Math.min(cantidad_solicitada, stock_disponible)
+      const cantidad_pendiente_inicial = cantidad_solicitada - cantidad_entregada_inicial
+
+      if (cantidad_pendiente_inicial > 0) {
+        shouldBePending = true // Si algún producto tiene un déficit, la venta se marca como pendiente
       }
 
       const precioUnitario = Number.parseFloat(item.precioUnitario || prod.precio_venta)
-      const cantidad = Number.parseInt(item.cantidad)
-      const subtotalItem = precioUnitario * cantidad
+      const subtotalItem = precioUnitario * cantidad_solicitada
       const discountPercentage = Number.parseFloat(item.discount_percentage || 0)
+
+      // Actualizar el stock del producto inmediatamente (puede volverse negativo)
+      const newStock = stock_disponible - cantidad_solicitada
+      await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [newStock, item.productoId])
+
+      // Registrar movimiento de stock solo por la cantidad que se entrega físicamente en este momento
+      if (cantidad_entregada_inicial > 0) {
+        await connection.query(
+          `
+          INSERT INTO movimientos_stock (
+            producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
+          ) VALUES (?, ?, 'salida', ?, ?, ?, ?)
+        `,
+          [
+            item.productoId,
+            req.user.id,
+            cantidad_entregada_inicial, // Cantidad que sale del stock físico ahora
+            stock_disponible, // Stock antes de esta operación
+            newStock, // Stock después de esta operación (puede ser negativo)
+            `Venta ${numeroFactura} - Entrega inicial (${cantidad_entregada_inicial} de ${cantidad_solicitada} solicitadas)`,
+          ],
+        )
+      }
 
       productsToProcess.push({
         ...item,
         nombre: prod.nombre,
         precioUnitario,
-        cantidad,
+        cantidad: cantidad_solicitada, // Cantidad total solicitada
         subtotalItem,
         discount_percentage: discountPercentage,
-        hasEnoughStock: hasEnoughStock, // Almacenar si tiene suficiente stock
-        currentStock: prod.stock, // Almacenar stock actual para el log
+        cantidad_entregada_inicial: cantidad_entregada_inicial, // Cantidad entregada en este momento
       })
 
       subtotal += subtotalItem
@@ -235,13 +268,6 @@ export const createSale = async (req, res) => {
       }
     }
 
-    const numeroFactura = await generateInvoiceNumber(connection)
-
-    if (!numeroFactura) {
-      await connection.rollback()
-      return res.status(500).json({ message: "Error al generar número de factura" })
-    }
-
     // Determinar el estado inicial de la venta
     const initialSaleStatus = shouldBePending ? "pendiente" : "completada"
 
@@ -273,45 +299,17 @@ export const createSale = async (req, res) => {
 
     for (const item of productsToProcess) {
       const discountPercentage = Number.parseFloat(item.discount_percentage || 0)
-      let cantidadEntregada = 0
-
-      if (initialSaleStatus === "completada") {
-        // Si la venta se crea como 'completada', se considera que los productos se entregan inmediatamente
-        cantidadEntregada = item.cantidad
-
-        // Decrementar stock del producto
-        const newStock = item.currentStock - item.cantidad
-        await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [newStock, item.productoId])
-
-        // Registrar movimiento de stock de salida
-        await connection.query(
-          `
-          INSERT INTO movimientos_stock (
-            producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
-          ) VALUES (?, ?, 'salida', ?, ?, ?, ?)
-        `,
-          [
-            item.productoId,
-            req.user.id,
-            item.cantidad,
-            item.currentStock,
-            newStock,
-            `Venta completada ${numeroFactura} - Entrega inmediata`,
-          ],
-        )
-      }
-      // Si initialSaleStatus es 'pendiente', cantidadEntregada permanece en 0 y el stock no se toca.
 
       await connection.query(
         "INSERT INTO detalles_ventas (venta_id, producto_id, cantidad, precio_unitario, subtotal, discount_percentage, cantidad_entregada) VALUES (?, ?, ?, ?, ?, ?, ?)",
         [
           ventaId,
           item.productoId,
-          item.cantidad,
+          item.cantidad, // Cantidad total solicitada
           item.precioUnitario,
           item.subtotalItem,
           discountPercentage,
-          cantidadEntregada,
+          item.cantidad_entregada_inicial, // Cantidad entregada en este momento
         ],
       )
     }
@@ -754,37 +752,34 @@ export const cancelSale = async (req, res) => {
 
     const sale = sales[0]
 
-    // Solo revertir stock si la venta estaba completada
-    if (sale.estado === "completada") {
-      const [details] = await connection.query("SELECT * FROM detalles_ventas WHERE venta_id = ?", [id])
+    // Revertir stock solo por la cantidad que fue entregada (y por lo tanto, decrementó el stock)
+    const [details] = await connection.query("SELECT * FROM detalles_ventas WHERE venta_id = ?", [id])
 
-      for (const detail of details) {
-        // Solo revertir la cantidad que fue entregada (y por lo tanto, decrementó el stock)
-        const cantidadARevertir = detail.cantidad_entregada
+    for (const detail of details) {
+      const cantidadARevertir = detail.cantidad_entregada
 
-        if (cantidadARevertir > 0) {
-          const [stockActual] = await connection.query("SELECT stock FROM productos WHERE id = ?", [detail.producto_id])
+      if (cantidadARevertir > 0) {
+        const [stockActual] = await connection.query("SELECT stock FROM productos WHERE id = ?", [detail.producto_id])
 
-          const nuevoStock = stockActual[0].stock + cantidadARevertir
+        const nuevoStock = stockActual[0].stock + cantidadARevertir
 
-          await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [nuevoStock, detail.producto_id])
+        await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [nuevoStock, detail.producto_id])
 
-          await connection.query(
-            `
-            INSERT INTO movimientos_stock (
-              producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
-            ) VALUES (?, ?, 'entrada', ?, ?, ?, ?)
-          `,
-            [
-              detail.producto_id,
-              req.user.id,
-              cantidadARevertir,
-              stockActual[0].stock,
-              nuevoStock,
-              `Anulación venta ${sale.numero_factura} - ${motivo} (reversión de ${cantidadARevertir} unidades entregadas)`,
-            ],
-          )
-        }
+        await connection.query(
+          `
+          INSERT INTO movimientos_stock (
+            producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
+          ) VALUES (?, ?, 'entrada', ?, ?, ?, ?)
+        `,
+          [
+            detail.producto_id,
+            req.user.id,
+            cantidadARevertir,
+            stockActual[0].stock,
+            nuevoStock,
+            `Anulación venta ${sale.numero_factura} - ${motivo} (reversión de ${cantidadARevertir} unidades entregadas)`,
+          ],
+        )
       }
     }
 
@@ -1098,7 +1093,10 @@ export const deliverProducts = async (req, res) => {
         detail.producto_id,
       ])
       const currentStock = productStock[0].stock
-      const newStock = currentStock - quantity
+      // El nuevo stock se calcula sumando la cantidad entregada al stock actual.
+      // Esto asume que la cantidad entregada "ingresa" al stock para ser vendida,
+      // resolviendo el stock negativo.
+      const newStock = currentStock + quantity
 
       await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [newStock, detail.producto_id])
 
@@ -1111,10 +1109,10 @@ export const deliverProducts = async (req, res) => {
         [
           detail.producto_id,
           req.user.id,
-          quantity,
+          quantity, // Cantidad que se entrega ahora
           currentStock,
           newStock,
-          `Entrega de venta ${sale.numero_factura} - Detalle ${detalleId}`,
+          `Entrega de venta ${sale.numero_factura} - Cumpliendo pendiente (${quantity} unidades)`,
         ],
       )
 
