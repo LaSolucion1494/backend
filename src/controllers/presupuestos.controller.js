@@ -1,6 +1,12 @@
-// presupuestos.controller.js
+// presupuestos.controller.js - ACTUALIZADO PARA FUNCIONAR COMO VENTA SIN FACTURA
 import pool from "../db.js"
 import { validationResult } from "express-validator"
+
+// VALORES HARDCODEADOS PARA CUENTA CORRIENTE
+const CUENTA_CORRIENTE_CONFIG = {
+  activa: true,
+  limite_credito_default: 50000,
+}
 
 // Función para obtener datos de la empresa desde la configuración
 const getCompanyDataFromConfig = async (connection) => {
@@ -92,7 +98,7 @@ const generatePresupuestoNumber = async (connection) => {
   }
 }
 
-// Crear un nuevo presupuesto
+// Crear un nuevo presupuesto (FUNCIONA IGUAL QUE UNA VENTA)
 export const createPresupuesto = async (req, res) => {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
@@ -112,7 +118,6 @@ export const createPresupuesto = async (req, res) => {
       observaciones = "",
       pagos = [],
       fechaPresupuesto,
-      validezDias = 30,
     } = req.body
 
     if (!productos || productos.length === 0) {
@@ -130,7 +135,10 @@ export const createPresupuesto = async (req, res) => {
     const [clienteData] = await connection.query(
       `SELECT 
         c.id, 
-        c.nombre
+        c.nombre, 
+        c.tiene_cuenta_corriente,
+        c.limite_credito,
+        c.saldo_cuenta_corriente
       FROM clientes c
       WHERE c.id = ? AND c.activo = TRUE`,
       [clienteId],
@@ -145,6 +153,7 @@ export const createPresupuesto = async (req, res) => {
 
     let subtotal = 0
     const productsToProcess = []
+    let shouldBePending = false
 
     // Generar número de presupuesto
     const numeroPresupuesto = await generatePresupuestoNumber(connection)
@@ -154,10 +163,10 @@ export const createPresupuesto = async (req, res) => {
       return res.status(500).json({ message: "Error al generar número de presupuesto" })
     }
 
-    // Procesar productos (sin afectar stock)
+    // PROCESAR PRODUCTOS IGUAL QUE EN VENTAS (AFECTAR STOCK)
     for (const item of productos) {
       const [producto] = await connection.query(
-        "SELECT id, nombre, precio_venta FROM productos WHERE id = ? AND activo = TRUE",
+        "SELECT id, nombre, stock, precio_venta FROM productos WHERE id = ? AND activo = TRUE FOR UPDATE",
         [item.productoId],
       )
 
@@ -167,18 +176,52 @@ export const createPresupuesto = async (req, res) => {
       }
 
       const prod = producto[0]
-      const cantidad = Number.parseInt(item.cantidad)
+      const cantidad_solicitada = Number.parseInt(item.cantidad)
+      const stock_disponible = Number.parseInt(prod.stock)
+
+      // Determinar cuánto se puede entregar inmediatamente
+      const cantidad_entregada_inicial = Math.min(cantidad_solicitada, stock_disponible)
+      const cantidad_pendiente_inicial = cantidad_solicitada - cantidad_entregada_inicial
+
+      if (cantidad_pendiente_inicial > 0) {
+        shouldBePending = true
+      }
+
       const precioUnitario = Number.parseFloat(item.precioUnitario || prod.precio_venta)
-      const subtotalItem = precioUnitario * cantidad
+      const subtotalItem = precioUnitario * cantidad_solicitada
       const discountPercentage = Number.parseFloat(item.discount_percentage || 0)
+
+      // ACTUALIZAR STOCK (IGUAL QUE EN VENTAS)
+      const newStock = stock_disponible - cantidad_solicitada
+      await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [newStock, item.productoId])
+
+      // REGISTRAR MOVIMIENTO DE STOCK
+      if (cantidad_entregada_inicial > 0) {
+        await connection.query(
+          `
+          INSERT INTO movimientos_stock (
+            producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
+          ) VALUES (?, ?, 'salida', ?, ?, ?, ?)
+        `,
+          [
+            item.productoId,
+            req.user.id,
+            cantidad_entregada_inicial,
+            stock_disponible,
+            newStock,
+            `Presupuesto ${numeroPresupuesto} - Entrega inicial (${cantidad_entregada_inicial} de ${cantidad_solicitada} solicitadas)`,
+          ],
+        )
+      }
 
       productsToProcess.push({
         ...item,
         nombre: prod.nombre,
         precioUnitario,
-        cantidad,
+        cantidad: cantidad_solicitada,
         subtotalItem,
         discount_percentage: discountPercentage,
+        cantidad_entregada_inicial: cantidad_entregada_inicial,
       })
 
       subtotal += subtotalItem
@@ -196,17 +239,55 @@ export const createPresupuesto = async (req, res) => {
       })
     }
 
-    // Calcular fecha de vencimiento
-    const fechaVencimiento = new Date(fechaPresupuesto)
-    fechaVencimiento.setDate(fechaVencimiento.getDate() + Number.parseInt(validezDias))
+    const pagoCuentaCorriente = pagos.find((pago) => pago.tipo === "cuenta_corriente")
+    const tieneCuentaCorriente = !!pagoCuentaCorriente
+
+    // MANEJAR CUENTA CORRIENTE IGUAL QUE EN VENTAS
+    if (tieneCuentaCorriente) {
+      if (!CUENTA_CORRIENTE_CONFIG.activa) {
+        await connection.rollback()
+        return res.status(400).json({ message: "La funcionalidad de cuenta corriente no está disponible" })
+      }
+
+      if (!cliente.tiene_cuenta_corriente) {
+        await connection.rollback()
+        return res.status(400).json({ message: "El cliente no tiene cuenta corriente habilitada" })
+      }
+
+      const montoCuentaCorriente = Number.parseFloat(pagoCuentaCorriente.monto)
+
+      const [saldoActualResult] = await connection.query(
+        "SELECT saldo_cuenta_corriente FROM clientes WHERE id = ? FOR UPDATE",
+        [clienteId],
+      )
+
+      if (saldoActualResult.length === 0) {
+        await connection.rollback()
+        return res.status(400).json({ message: "Cliente no encontrado" })
+      }
+
+      const saldoActual = Number.parseFloat(saldoActualResult[0].saldo_cuenta_corriente)
+      const nuevoSaldo = saldoActual + montoCuentaCorriente
+
+      if (cliente.limite_credito && nuevoSaldo > Number.parseFloat(cliente.limite_credito)) {
+        const disponible = Number.parseFloat(cliente.limite_credito) - saldoActual
+        await connection.rollback()
+        return res.status(400).json({
+          message: `El monto excede el límite de crédito disponible. Límite: $${Number.parseFloat(cliente.limite_credito).toFixed(2)}, Saldo actual: $${saldoActual.toFixed(2)}, Disponible: $${disponible.toFixed(2)}`,
+        })
+      }
+    }
+
+    // Determinar el estado inicial
+    const initialStatus = shouldBePending ? "pendiente" : "completada"
 
     const [presupuestoResult] = await connection.query(
       `
       INSERT INTO presupuestos (
         numero_presupuesto, cliente_id, usuario_id, fecha_presupuesto,
         subtotal, descuento, interes, total, observaciones,
-        fecha_vencimiento, empresa_datos, estado
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'activo')
+        tiene_cuenta_corriente, empresa_datos, estado
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
       [
         numeroPresupuesto,
@@ -218,42 +299,101 @@ export const createPresupuesto = async (req, res) => {
         interesNum,
         total,
         observaciones,
-        fechaVencimiento.toISOString().split("T")[0],
+        tieneCuentaCorriente,
         JSON.stringify(empresaDatos),
+        initialStatus,
       ],
     )
 
     const presupuestoId = presupuestoResult.insertId
 
-    // Insertar detalles del presupuesto
+    // INSERTAR DETALLES CON CANTIDAD ENTREGADA
     for (const item of productsToProcess) {
       const discountPercentage = Number.parseFloat(item.discount_percentage || 0)
 
       await connection.query(
-        "INSERT INTO detalles_presupuestos (presupuesto_id, producto_id, cantidad, precio_unitario, subtotal, discount_percentage) VALUES (?, ?, ?, ?, ?, ?)",
-        [presupuestoId, item.productoId, item.cantidad, item.precioUnitario, item.subtotalItem, discountPercentage],
+        "INSERT INTO detalles_presupuestos (presupuesto_id, producto_id, cantidad, precio_unitario, subtotal, discount_percentage, cantidad_entregada) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+          presupuestoId,
+          item.productoId,
+          item.cantidad,
+          item.precioUnitario,
+          item.subtotalItem,
+          discountPercentage,
+          item.cantidad_entregada_inicial,
+        ],
       )
     }
 
-    // Insertar métodos de pago (solo para referencia)
+    let movimientoCuentaId = null
+
+    // PROCESAR PAGOS IGUAL QUE EN VENTAS
     for (const pago of pagos) {
+      let movimientoId = null
+
+      if (pago.tipo === "cuenta_corriente") {
+        const montoCuentaCorriente = Number.parseFloat(pago.monto)
+
+        const [saldoActualResult] = await connection.query(
+          "SELECT saldo_cuenta_corriente FROM clientes WHERE id = ? FOR UPDATE",
+          [clienteId],
+        )
+
+        const saldoAnterior = Number.parseFloat(saldoActualResult[0].saldo_cuenta_corriente)
+        const nuevoSaldo = saldoAnterior + montoCuentaCorriente
+
+        const [movimientoResult] = await connection.query(
+          `
+          INSERT INTO movimientos_cuenta_corriente (
+            cliente_id, usuario_id, tipo, concepto,
+            monto, saldo_anterior, saldo_nuevo, referencia_id, referencia_tipo,
+            numero_referencia, descripcion
+          ) VALUES (?, ?, 'debito', 'presupuesto', ?, ?, ?, ?, 'presupuesto', ?, ?)
+        `,
+          [
+            clienteId,
+            req.user.id,
+            montoCuentaCorriente,
+            saldoAnterior,
+            nuevoSaldo,
+            presupuestoId,
+            numeroPresupuesto,
+            `Presupuesto ${numeroPresupuesto} - ${cliente.nombre}`,
+          ],
+        )
+
+        movimientoId = movimientoResult.insertId
+        movimientoCuentaId = movimientoId
+
+        await connection.query("UPDATE clientes SET saldo_cuenta_corriente = ROUND(?, 2) WHERE id = ?", [
+          nuevoSaldo,
+          clienteId,
+        ])
+
+        await connection.query("UPDATE presupuestos SET movimiento_cuenta_id = ? WHERE id = ?", [
+          movimientoId,
+          presupuestoId,
+        ])
+      }
+
       await connection.query(
-        "INSERT INTO presupuesto_pagos (presupuesto_id, tipo_pago, monto, descripcion) VALUES (?, ?, ?, ?)",
-        [presupuestoId, pago.tipo, Number.parseFloat(pago.monto), pago.descripcion || ""],
+        "INSERT INTO presupuesto_pagos (presupuesto_id, tipo_pago, monto, descripcion, movimiento_cuenta_id) VALUES (?, ?, ?, ?, ?)",
+        [presupuestoId, pago.tipo, Number.parseFloat(pago.monto), pago.descripcion || "", movimientoId],
       )
     }
 
     await connection.commit()
 
     res.status(201).json({
-      message: "Presupuesto creado exitosamente",
+      message: `Presupuesto creado exitosamente como ${initialStatus}`,
       data: {
         id: presupuestoId,
         numeroPresupuesto: numeroPresupuesto,
         total,
-        fechaVencimiento: fechaVencimiento.toISOString().split("T")[0],
+        tieneCuentaCorriente,
+        movimientoCuentaId,
         empresaDatos,
-        estado: "activo",
+        estado: initialStatus,
       },
     })
   } catch (error) {
@@ -325,7 +465,8 @@ export const getPresupuestoById = async (req, res) => {
         dp.*,
         p.nombre as producto_nombre,
         p.codigo as producto_codigo,
-        p.marca as producto_marca
+        p.marca as producto_marca,
+        p.stock as producto_stock_actual
       FROM detalles_presupuestos dp
       JOIN productos p ON dp.producto_id = p.id
       WHERE dp.presupuesto_id = ?
@@ -336,9 +477,14 @@ export const getPresupuestoById = async (req, res) => {
 
     const [payments] = await pool.query(
       `
-      SELECT * FROM presupuesto_pagos
-      WHERE presupuesto_id = ? 
-      ORDER BY id
+      SELECT 
+        pp.*,
+        mcc.numero_referencia as movimiento_numero,
+        mcc.descripcion as movimiento_descripcion
+      FROM presupuesto_pagos pp
+      LEFT JOIN movimientos_cuenta_corriente mcc ON pp.movimiento_cuenta_id = mcc.id
+      WHERE pp.presupuesto_id = ? 
+      ORDER BY pp.id
     `,
       [id],
     )
@@ -346,9 +492,6 @@ export const getPresupuestoById = async (req, res) => {
     const presupuestoData = {
       ...presupuesto,
       fecha_presupuesto: presupuesto.fecha_presupuesto.toISOString().split("T")[0],
-      fecha_vencimiento: presupuesto.fecha_vencimiento
-        ? presupuesto.fecha_vencimiento.toISOString().split("T")[0]
-        : null,
       fecha_creacion: presupuesto.fecha_creacion.toISOString(),
       fecha_actualizacion: presupuesto.fecha_actualizacion.toISOString(),
       empresa_datos: empresaDatos,
@@ -426,13 +569,13 @@ export const getPresupuestos = async (req, res) => {
         p.id,
         p.numero_presupuesto,
         p.fecha_presupuesto,
-        p.fecha_vencimiento,
         p.subtotal,
         p.descuento,
         p.interes,
         p.total,
         p.estado,
         p.observaciones,
+        p.tiene_cuenta_corriente,
         p.fecha_creacion,
         c.nombre as cliente_nombre,
         u.nombre as usuario_nombre
@@ -446,9 +589,6 @@ export const getPresupuestos = async (req, res) => {
     const presupuestosWithISODate = presupuestos.map((presupuesto) => ({
       ...presupuesto,
       fecha_presupuesto: presupuesto.fecha_presupuesto.toISOString().split("T")[0],
-      fecha_vencimiento: presupuesto.fecha_vencimiento
-        ? presupuesto.fecha_vencimiento.toISOString().split("T")[0]
-        : null,
       fecha_creacion: presupuesto.fecha_creacion.toISOString(),
     }))
 
@@ -472,13 +612,334 @@ export const getPresupuestos = async (req, res) => {
   }
 }
 
-// Cambiar estado de presupuesto
+// Anular presupuesto (IGUAL QUE ANULAR VENTA)
+export const cancelPresupuesto = async (req, res) => {
+  const connection = await pool.getConnection()
+
+  try {
+    await connection.beginTransaction()
+
+    const { id } = req.params
+    const { motivo = "" } = req.body
+
+    const [presupuestos] = await connection.query("SELECT * FROM presupuestos WHERE id = ? AND estado != 'anulado'", [
+      id,
+    ])
+
+    if (presupuestos.length === 0) {
+      await connection.rollback()
+      return res.status(404).json({ message: "Presupuesto no encontrado o ya está anulado" })
+    }
+
+    const presupuesto = presupuestos[0]
+
+    // Revertir stock
+    const [details] = await connection.query("SELECT * FROM detalles_presupuestos WHERE presupuesto_id = ?", [id])
+
+    for (const detail of details) {
+      const cantidadARevertir = detail.cantidad_entregada
+
+      if (cantidadARevertir > 0) {
+        const [stockActual] = await connection.query("SELECT stock FROM productos WHERE id = ?", [detail.producto_id])
+
+        const nuevoStock = stockActual[0].stock + cantidadARevertir
+
+        await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [nuevoStock, detail.producto_id])
+
+        await connection.query(
+          `
+          INSERT INTO movimientos_stock (
+            producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
+          ) VALUES (?, ?, 'entrada', ?, ?, ?, ?)
+        `,
+          [
+            detail.producto_id,
+            req.user.id,
+            cantidadARevertir,
+            stockActual[0].stock,
+            nuevoStock,
+            `Anulación presupuesto ${presupuesto.numero_presupuesto} - ${motivo} (reversión de ${cantidadARevertir} unidades entregadas)`,
+          ],
+        )
+      }
+    }
+
+    // Revertir cuenta corriente si aplica
+    if (presupuesto.tiene_cuenta_corriente) {
+      const [pagosCuentaCorriente] = await connection.query(
+        `
+        SELECT pp.*, mcc.* 
+        FROM presupuesto_pagos pp
+        JOIN movimientos_cuenta_corriente mcc ON pp.movimiento_cuenta_id = mcc.id
+        WHERE pp.presupuesto_id = ? AND pp.tipo_pago = 'cuenta_corriente'
+      `,
+        [id],
+      )
+
+      for (const pago of pagosCuentaCorriente) {
+        const [clienteInfo] = await connection.query(
+          "SELECT saldo_cuenta_corriente FROM clientes WHERE id = ? FOR UPDATE",
+          [pago.cliente_id],
+        )
+
+        if (clienteInfo.length > 0) {
+          const saldoAnterior = Number.parseFloat(clienteInfo[0].saldo_cuenta_corriente)
+          const montoRevertir = Number.parseFloat(pago.monto)
+          const nuevoSaldo = Math.max(0, saldoAnterior - montoRevertir)
+
+          await connection.query(
+            `
+            INSERT INTO movimientos_cuenta_corriente (
+              cliente_id, usuario_id, tipo, concepto,
+              monto, saldo_anterior, saldo_nuevo, referencia_id, referencia_tipo,
+              numero_referencia, descripcion
+            ) VALUES (?, ?, 'credito', 'nota_credito', ?, ?, ?, ?, 'anulacion_presupuesto', ?, ?)
+          `,
+            [
+              presupuesto.cliente_id,
+              req.user.id,
+              montoRevertir,
+              saldoAnterior,
+              nuevoSaldo,
+              id,
+              presupuesto.numero_presupuesto,
+              `Anulación presupuesto ${presupuesto.numero_presupuesto} - ${motivo}`,
+            ],
+          )
+
+          await connection.query("UPDATE clientes SET saldo_cuenta_corriente = ROUND(?, 2) WHERE id = ?", [
+            nuevoSaldo,
+            presupuesto.cliente_id,
+          ])
+        }
+      }
+    }
+
+    await connection.query(
+      "UPDATE presupuestos SET estado = 'anulado', observaciones = CONCAT(COALESCE(observaciones, ''), ' - ANULADO: ', ?) WHERE id = ?",
+      [motivo, id],
+    )
+
+    await connection.commit()
+
+    res.status(200).json({
+      message: "Presupuesto anulado exitosamente",
+      data: {
+        id,
+        numeroPresupuesto: presupuesto.numero_presupuesto,
+        motivo,
+      },
+    })
+  } catch (error) {
+    await connection.rollback()
+    console.error("Error al anular presupuesto:", error)
+    res.status(500).json({ message: error.message || "Error al anular presupuesto" })
+  } finally {
+    connection.release()
+  }
+}
+
+// NUEVA FUNCIÓN: Entregar productos de un presupuesto pendiente
+export const deliverProductsPresupuesto = async (req, res) => {
+  const errors = validationResult(req)
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() })
+  }
+
+  const connection = await pool.getConnection()
+
+  try {
+    await connection.beginTransaction()
+
+    const { id } = req.params
+    const { deliveries } = req.body
+
+    const [presupuestoResult] = await connection.query(
+      "SELECT id, numero_presupuesto, estado FROM presupuestos WHERE id = ? FOR UPDATE",
+      [id],
+    )
+
+    if (presupuestoResult.length === 0) {
+      await connection.rollback()
+      return res.status(404).json({ message: "Presupuesto no encontrado" })
+    }
+
+    const presupuesto = presupuestoResult[0]
+
+    for (const delivery of deliveries) {
+      const { detalleId, quantity } = delivery
+
+      if (quantity <= 0) {
+        continue
+      }
+
+      const [detailResult] = await connection.query(
+        "SELECT id, producto_id, cantidad, cantidad_entregada FROM detalles_presupuestos WHERE id = ? AND presupuesto_id = ? FOR UPDATE",
+        [detalleId, id],
+      )
+
+      if (detailResult.length === 0) {
+        await connection.rollback()
+        return res.status(404).json({ message: `Detalle de presupuesto con ID ${detalleId} no encontrado` })
+      }
+
+      const detail = detailResult[0]
+      const remainingToDeliver = detail.cantidad - detail.cantidad_entregada
+
+      if (quantity > remainingToDeliver) {
+        await connection.rollback()
+        return res.status(400).json({
+          message: `No se puede entregar más de lo pendiente para el detalle ${detalleId}. Pendiente: ${remainingToDeliver}`,
+        })
+      }
+
+      const newCantidadEntregada = detail.cantidad_entregada + quantity
+
+      await connection.query("UPDATE detalles_presupuestos SET cantidad_entregada = ? WHERE id = ?", [
+        newCantidadEntregada,
+        detalleId,
+      ])
+
+      const [productStock] = await connection.query("SELECT stock FROM productos WHERE id = ? FOR UPDATE", [
+        detail.producto_id,
+      ])
+      const currentStock = productStock[0].stock
+      const newStock = currentStock + quantity
+
+      await connection.query("UPDATE productos SET stock = ? WHERE id = ?", [newStock, detail.producto_id])
+
+      await connection.query(
+        `
+        INSERT INTO movimientos_stock (
+          producto_id, usuario_id, tipo, cantidad, stock_anterior, stock_nuevo, motivo
+        ) VALUES (?, ?, 'salida', ?, ?, ?, ?)
+      `,
+        [
+          detail.producto_id,
+          req.user.id,
+          quantity,
+          currentStock,
+          newStock,
+          `Entrega de presupuesto ${presupuesto.numero_presupuesto} - Cumpliendo pendiente (${quantity} unidades)`,
+        ],
+      )
+    }
+
+    // Verificar si todos los productos han sido entregados
+    const [allDetails] = await connection.query(
+      "SELECT cantidad, cantidad_entregada FROM detalles_presupuestos WHERE presupuesto_id = ?",
+      [id],
+    )
+
+    const allProductsDelivered = allDetails.every((d) => d.cantidad_entregada >= d.cantidad)
+
+    if (allProductsDelivered && presupuesto.estado !== "completado") {
+      await connection.query("UPDATE presupuestos SET estado = 'completado' WHERE id = ?", [id])
+    } else if (!allProductsDelivered && presupuesto.estado !== "pendiente") {
+      await connection.query("UPDATE presupuestos SET estado = 'pendiente' WHERE id = ?", [id])
+    }
+
+    await connection.commit()
+
+    res.status(200).json({
+      message: allProductsDelivered
+        ? "Presupuesto completado y productos entregados exitosamente"
+        : "Productos entregados parcialmente. Presupuesto sigue pendiente.",
+      data: {
+        presupuestoId: id,
+        numeroPresupuesto: presupuesto.numero_presupuesto,
+        newStatus: allProductsDelivered ? "completado" : "pendiente",
+        allProductsDelivered: allProductsDelivered,
+      },
+    })
+  } catch (error) {
+    await connection.rollback()
+    console.error("Error al entregar productos:", error)
+    res.status(500).json({ message: error.message || "Error al entregar productos" })
+  } finally {
+    connection.release()
+  }
+}
+
+// Obtener estadísticas de presupuestos
+export const getPresupuestosStats = async (req, res) => {
+  try {
+    const { fechaInicio = "", fechaFin = "" } = req.query
+
+    let whereClause = "WHERE 1=1"
+    const queryParams = []
+
+    if (fechaInicio) {
+      whereClause += " AND DATE(p.fecha_presupuesto) >= ?"
+      queryParams.push(fechaInicio)
+    }
+
+    if (fechaFin) {
+      whereClause += " AND DATE(p.fecha_presupuesto) <= ?"
+      queryParams.push(fechaFin)
+    }
+
+    const [generalStats] = await pool.query(
+      `
+      SELECT 
+        COUNT(*) as total_presupuestos,
+        SUM(CASE WHEN p.estado = 'completado' THEN p.total ELSE 0 END) as total_facturado,
+        AVG(CASE WHEN p.estado = 'completado' THEN p.total ELSE NULL END) as promedio_presupuesto,
+        SUM(CASE WHEN p.tiene_cuenta_corriente AND p.estado = 'completado' THEN 1 ELSE 0 END) as presupuestos_cuenta_corriente,
+        SUM(CASE WHEN p.tiene_cuenta_corriente AND p.estado = 'completado' THEN p.total ELSE 0 END) as total_cuenta_corriente,
+        SUM(CASE WHEN p.estado = 'completado' THEN 1 ELSE 0 END) as presupuestos_completados,
+        SUM(CASE WHEN p.estado = 'anulado' THEN 1 ELSE 0 END) as presupuestos_anulados,
+        SUM(CASE WHEN p.estado = 'pendiente' THEN 1 ELSE 0 END) as presupuestos_pendientes
+      FROM presupuestos p
+      ${whereClause}
+    `,
+      queryParams,
+    )
+
+    const stats = {
+      estadisticas_generales: generalStats[0],
+    }
+
+    res.status(200).json(stats)
+  } catch (error) {
+    console.error("Error al obtener estadísticas:", error)
+    res.status(500).json({
+      success: false,
+      message: "Error al obtener estadísticas",
+      error: error.message,
+    })
+  }
+}
+
+// Actualizar presupuesto
+export const updatePresupuesto = async (req, res) => {
+  try {
+    const { id } = req.params
+    const { observaciones } = req.body
+
+    const [result] = await pool.query("UPDATE presupuestos SET observaciones = ? WHERE id = ?", [observaciones, id])
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Presupuesto no encontrado" })
+    }
+
+    res.status(200).json({
+      message: "Presupuesto actualizado exitosamente",
+      data: { id, observaciones },
+    })
+  } catch (error) {
+    console.error("Error al actualizar presupuesto:", error)
+    res.status(500).json({ message: "Error al actualizar presupuesto" })
+  }
+}
+
+// Cambiar estado de presupuesto (MANTENIDO PARA COMPATIBILIDAD)
 export const updatePresupuestoEstado = async (req, res) => {
   try {
     const { id } = req.params
     const { estado, observaciones = "" } = req.body
 
-    const validStates = ["activo", "convertido", "vencido", "cancelado"]
+    const validStates = ["activo", "completado", "pendiente", "anulado"]
     if (!validStates.includes(estado)) {
       return res.status(400).json({ message: "Estado inválido" })
     }
