@@ -39,6 +39,30 @@ const isValidPrice = (price) => {
   return !isNaN(num) && isFinite(num) && num >= 0
 }
 
+/**
+ * Obtiene la configuración de precios para un producto específico
+ * Usa configuración personalizada si existe, sino usa la configuración global
+ * @param {object} product - Producto con posible configuración personalizada
+ * @param {object} connection - Conexión a la base de datos
+ * @returns {Promise<object>} Configuración de precios a usar
+ */
+const getProductPricingConfig = async (product, connection) => {
+  // Si el producto tiene configuración personalizada, usarla
+  if (product && product.custom_pricing_config) {
+    console.log("Usando configuración personalizada del producto:", product.custom_pricing_config)
+    return {
+      rentabilidad: Number(product.custom_pricing_config.rentabilidad) || 40,
+      iva: Number(product.custom_pricing_config.iva) || 21,
+      ingresos_brutos: Number(product.custom_pricing_config.ingresos_brutos) || 0,
+      otros_impuestos: Number(product.custom_pricing_config.otros_impuestos) || 0,
+    }
+  }
+
+  // Sino, usar configuración global
+  console.log("Usando configuración global del sistema")
+  return await getPricingConfig(connection)
+}
+
 // Buscar producto por código
 export const getProductByCode = async (req, res) => {
   try {
@@ -48,11 +72,10 @@ export const getProductByCode = async (req, res) => {
       `
       SELECT 
         p.id, p.codigo, p.nombre, p.descripcion, p.marca, p.stock, p.stock_minimo,
-        p.precio_costo, p.precio_venta, p.tiene_codigo_barras as tieneCodigoBarras,
+        p.precio_costo, p.precio_venta, p.custom_pricing_config, p.tiene_codigo_barras as tieneCodigoBarras,
         p.fecha_ingreso as fechaIngreso, p.activo, p.categoria_id, p.proveedor_id,
         COALESCE(c.nombre, 'Sin Categoría') as categoria_nombre,
         COALESCE(pr.nombre, 'Sin Proveedor') as proveedor,
-        -- NUEVO: Obtener stock mínimo configurado por el usuario
         COALESCE(
           (SELECT valor FROM configuracion WHERE clave = 'stock_minimo_default'), 
           p.stock_minimo, 
@@ -70,7 +93,18 @@ export const getProductByCode = async (req, res) => {
       return res.status(404).json({ message: "Producto no encontrado con ese código" })
     }
 
-    res.status(200).json(products[0])
+    // Parsear configuración personalizada si existe
+    const product = products[0]
+    if (product.custom_pricing_config) {
+      try {
+        product.custom_pricing_config = JSON.parse(product.custom_pricing_config)
+      } catch (error) {
+        console.error("Error parsing custom pricing config:", error)
+        product.custom_pricing_config = null
+      }
+    }
+
+    res.status(200).json(product)
   } catch (error) {
     console.error("Error al buscar producto por código:", error)
     res.status(500).json({ message: "Error al buscar producto por código" })
@@ -84,7 +118,7 @@ export const getProducts = async (req, res) => {
       search = "",
       categoria = "",
       stockStatus = "todos",
-      activo = "true", // Por defecto, solo activos
+      activo = "true",
       minPrice = "",
       maxPrice = "",
       sortBy = "nombre",
@@ -136,11 +170,10 @@ export const getProducts = async (req, res) => {
     let dataQuery = `
       SELECT 
         p.id, p.codigo, p.nombre, p.descripcion, p.marca, p.stock, p.stock_minimo,
-        p.precio_costo, p.precio_venta, p.tiene_codigo_barras as tieneCodigoBarras,
+        p.precio_costo, p.precio_venta, p.custom_pricing_config, p.tiene_codigo_barras as tieneCodigoBarras,
         p.fecha_ingreso as fechaIngreso, p.activo, p.proveedor_id,
         COALESCE(c.nombre, 'Sin Categoría') as categoria_nombre,
         COALESCE(pr.nombre, 'Sin Proveedor') as proveedor,
-        -- NUEVO: Obtener stock mínimo configurado por el usuario
         COALESCE(
           (SELECT valor FROM configuracion WHERE clave = 'stock_minimo_default'), 
           p.stock_minimo, 
@@ -157,6 +190,18 @@ export const getProducts = async (req, res) => {
     dataQuery += ` LIMIT ? OFFSET ?`
     const finalDataParams = [...queryParams, Number.parseInt(limit), Number.parseInt(offset)]
     const [products] = await pool.query(dataQuery, finalDataParams)
+
+    // Parsear configuración personalizada para cada producto
+    products.forEach((product) => {
+      if (product.custom_pricing_config) {
+        try {
+          product.custom_pricing_config = JSON.parse(product.custom_pricing_config)
+        } catch (error) {
+          console.error("Error parsing custom pricing config for product", product.id, error)
+          product.custom_pricing_config = null
+        }
+      }
+    })
 
     res.status(200).json({
       success: true,
@@ -186,11 +231,10 @@ export const getProductById = async (req, res) => {
       `
       SELECT 
         p.id, p.codigo, p.nombre, p.descripcion, p.marca, p.stock, p.stock_minimo,
-        p.precio_costo, p.precio_venta, p.tiene_codigo_barras as tieneCodigoBarras,
+        p.precio_costo, p.precio_venta, p.custom_pricing_config, p.tiene_codigo_barras as tieneCodigoBarras,
         p.fecha_ingreso as fechaIngreso, p.activo, p.categoria_id, p.proveedor_id,
         COALESCE(c.nombre, 'Sin Categoría') as categoria_nombre,
         COALESCE(pr.nombre, 'Sin Proveedor') as proveedor,
-        -- NUEVO: Obtener stock mínimo configurado por el usuario
         COALESCE(
           (SELECT valor FROM configuracion WHERE clave = 'stock_minimo_default'), 
           p.stock_minimo, 
@@ -207,7 +251,19 @@ export const getProductById = async (req, res) => {
     if (products.length === 0) {
       return res.status(404).json({ message: "Producto no encontrado" })
     }
-    res.status(200).json(products[0])
+
+    // Parsear configuración personalizada si existe
+    const product = products[0]
+    if (product.custom_pricing_config) {
+      try {
+        product.custom_pricing_config = JSON.parse(product.custom_pricing_config)
+      } catch (error) {
+        console.error("Error parsing custom pricing config:", error)
+        product.custom_pricing_config = null
+      }
+    }
+
+    res.status(200).json(product)
   } catch (error) {
     console.error("Error al obtener producto:", error)
     res.status(500).json({ message: "Error al obtener producto" })
@@ -232,7 +288,10 @@ export const createProduct = async (req, res) => {
       precioCosto,
       proveedorId = 1,
       tieneCodigoBarras = false,
+      customConfig = null, // Nueva propiedad para configuración personalizada
     } = req.body
+
+    console.log("Creando producto con datos:", { codigo, nombre, precioCosto, customConfig })
 
     // Validar precio de costo
     if (!isValidPrice(precioCosto)) {
@@ -246,9 +305,23 @@ export const createProduct = async (req, res) => {
       return res.status(400).json({ message: "El código del producto ya existe" })
     }
 
-    // Usar la lógica centralizada de precios
-    const pricingConfig = await getPricingConfig(pool)
+    // Determinar qué configuración usar para el cálculo
+    let pricingConfig
+    if (customConfig) {
+      console.log("Usando configuración personalizada para el cálculo:", customConfig)
+      pricingConfig = {
+        rentabilidad: Number(customConfig.rentabilidad) || 40,
+        iva: Number(customConfig.iva) || 21,
+        ingresos_brutos: Number(customConfig.ingresos_brutos) || 0,
+        otros_impuestos: Number(customConfig.otros_impuestos) || 0,
+      }
+    } else {
+      console.log("Usando configuración global para el cálculo")
+      pricingConfig = await getPricingConfig(pool)
+    }
+
     const precioVenta = calculateSalePrice(precioCosto, pricingConfig)
+    console.log("Precio calculado:", { precioCosto, precioVenta, pricingConfig })
 
     // Validar que el precio calculado sea válido
     if (!isValidPrice(precioVenta)) {
@@ -264,10 +337,13 @@ export const createProduct = async (req, res) => {
       if (catResult.length > 0) categoriaId = catResult[0].id
     }
 
+    // Preparar configuración personalizada para almacenar
+    const customPricingConfig = customConfig ? JSON.stringify(customConfig) : null
+
     const [result] = await pool.query(
       `
-      INSERT INTO productos (codigo, nombre, descripcion, categoria_id, marca, stock, precio_costo, precio_venta, proveedor_id, tiene_codigo_barras, fecha_ingreso) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURDATE())
+      INSERT INTO productos (codigo, nombre, descripcion, categoria_id, marca, stock, precio_costo, precio_venta, custom_pricing_config, proveedor_id, tiene_codigo_barras, fecha_ingreso) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURDATE())
     `,
       [
         codigo,
@@ -278,6 +354,7 @@ export const createProduct = async (req, res) => {
         stock,
         precioCosto,
         precioVenta,
+        customPricingConfig,
         proveedorId,
         tieneCodigoBarras,
       ],
@@ -296,6 +373,7 @@ export const createProduct = async (req, res) => {
       id: result.insertId,
       precio_venta_calculado: precioVenta,
       desglose_calculo: breakdown,
+      configuracion_usada: customConfig ? "personalizada" : "global",
     })
   } catch (error) {
     console.error("Error al crear producto:", error)
@@ -312,7 +390,19 @@ export const updateProduct = async (req, res) => {
 
   try {
     const { id } = req.params
-    const { codigo, nombre, descripcion, categoria, marca, precioCosto, proveedorId, tieneCodigoBarras } = req.body
+    const {
+      codigo,
+      nombre,
+      descripcion,
+      categoria,
+      marca,
+      precioCosto,
+      proveedorId,
+      tieneCodigoBarras,
+      customConfig = null, // Nueva propiedad para configuración personalizada
+    } = req.body
+
+    console.log("Actualizando producto con datos:", { id, codigo, nombre, precioCosto, customConfig })
 
     // Validar precio de costo
     if (!isValidPrice(precioCosto)) {
@@ -329,9 +419,23 @@ export const updateProduct = async (req, res) => {
       return res.status(400).json({ message: "El código del producto ya existe en otro producto" })
     }
 
-    // Usar la lógica centralizada de precios
-    const pricingConfig = await getPricingConfig(pool)
+    // Determinar qué configuración usar para el cálculo
+    let pricingConfig
+    if (customConfig) {
+      console.log("Usando configuración personalizada para el cálculo:", customConfig)
+      pricingConfig = {
+        rentabilidad: Number(customConfig.rentabilidad) || 40,
+        iva: Number(customConfig.iva) || 21,
+        ingresos_brutos: Number(customConfig.ingresos_brutos) || 0,
+        otros_impuestos: Number(customConfig.otros_impuestos) || 0,
+      }
+    } else {
+      console.log("Usando configuración global para el cálculo")
+      pricingConfig = await getPricingConfig(pool)
+    }
+
     const precioVenta = calculateSalePrice(precioCosto, pricingConfig)
+    console.log("Precio calculado:", { precioCosto, precioVenta, pricingConfig })
 
     // Validar que el precio calculado sea válido
     if (!isValidPrice(precioVenta)) {
@@ -347,13 +451,28 @@ export const updateProduct = async (req, res) => {
       if (catResult.length > 0) categoriaId = catResult[0].id
     }
 
+    // Preparar configuración personalizada para almacenar
+    const customPricingConfig = customConfig ? JSON.stringify(customConfig) : null
+
     await pool.query(
       `
       UPDATE productos SET codigo = ?, nombre = ?, descripcion = ?, categoria_id = ?, marca = ?, 
-      precio_costo = ?, precio_venta = ?, proveedor_id = ?, tiene_codigo_barras = ?
+      precio_costo = ?, precio_venta = ?, custom_pricing_config = ?, proveedor_id = ?, tiene_codigo_barras = ?
       WHERE id = ?
     `,
-      [codigo, nombre, descripcion, categoriaId, marca, precioCosto, precioVenta, proveedorId, tieneCodigoBarras, id],
+      [
+        codigo,
+        nombre,
+        descripcion,
+        categoriaId,
+        marca,
+        precioCosto,
+        precioVenta,
+        customPricingConfig,
+        proveedorId,
+        tieneCodigoBarras,
+        id,
+      ],
     )
 
     const breakdown = getPriceBreakdown(precioCosto, pricingConfig)
@@ -361,6 +480,7 @@ export const updateProduct = async (req, res) => {
       message: "Producto actualizado exitosamente",
       precio_venta_calculado: precioVenta,
       desglose_calculo: breakdown,
+      configuracion_usada: customConfig ? "personalizada" : "global",
     })
   } catch (error) {
     console.error("Error al actualizar producto:", error)
@@ -377,10 +497,15 @@ export const updateProductPrices = async (req, res) => {
 
   try {
     const { id } = req.params
-    const { precio_costo, precio_venta } = req.body
+    const { precio_costo, precio_venta, customConfig = null } = req.body
+
+    console.log("Actualizando precios del producto:", { id, precio_costo, precio_venta, customConfig })
 
     // Validar que el producto existe
-    const [existingProduct] = await pool.query("SELECT id, nombre, codigo FROM productos WHERE id = ?", [id])
+    const [existingProduct] = await pool.query(
+      "SELECT id, nombre, codigo, custom_pricing_config FROM productos WHERE id = ?",
+      [id],
+    )
     if (existingProduct.length === 0) {
       return res.status(404).json({ message: "Producto no encontrado" })
     }
@@ -393,194 +518,59 @@ export const updateProductPrices = async (req, res) => {
     let finalPrecioVenta = precio_venta
 
     // Si no se proporciona precio de venta, calcularlo automáticamente
-    if (!precio_venta) {
-      const pricingConfig = await getPricingConfig(pool)
+    if (!finalPrecioVenta) {
+      const pricingConfig = customConfig
+        ? {
+            rentabilidad: Number(customConfig.rentabilidad) || 40,
+            iva: Number(customConfig.iva) || 21,
+            ingresos_brutos: Number(customConfig.ingresos_brutos) || 0,
+            otros_impuestos: Number(customConfig.otros_impuestos) || 0,
+          }
+        : await getPricingConfig(pool)
+
       finalPrecioVenta = calculateSalePrice(precio_costo, pricingConfig)
+      console.log("Precio calculado automáticamente:", { precio_costo, finalPrecioVenta, pricingConfig })
+
+      // Validar que el precio calculado sea válido
+      if (!isValidPrice(finalPrecioVenta)) {
+        console.error("Error calculando precio de venta automáticamente:", {
+          precio_costo,
+          pricingConfig,
+          finalPrecioVenta,
+        })
+        return res.status(500).json({
+          message: "Error al calcular el precio de venta automáticamente. Verifique la configuración de precios.",
+        })
+      }
     }
 
-    // Validar precio de venta final
-    if (!isValidPrice(finalPrecioVenta)) {
-      return res.status(400).json({ message: "Error al calcular o validar el precio de venta" })
-    }
+    await pool.query(
+      `
+      UPDATE productos SET precio_costo = ?, precio_venta = ?, custom_pricing_config = ?
+      WHERE id = ?
+    `,
+      [precio_costo, finalPrecioVenta, customConfig ? JSON.stringify(customConfig) : null, id],
+    )
 
-    // Actualizar solo los precios
-    await pool.query("UPDATE productos SET precio_costo = ?, precio_venta = ? WHERE id = ?", [
+    const breakdown = getPriceBreakdown(
       precio_costo,
-      finalPrecioVenta,
-      id,
-    ])
-
-    // Obtener desglose del cálculo para información
-    const pricingConfig = await getPricingConfig(pool)
-    const breakdown = getPriceBreakdown(precio_costo, pricingConfig)
-
+      customConfig
+        ? {
+            rentabilidad: Number(customConfig.rentabilidad) || 40,
+            iva: Number(customConfig.iva) || 21,
+            ingresos_brutos: Number(customConfig.ingresos_brutos) || 0,
+            otros_impuestos: Number(customConfig.otros_impuestos) || 0,
+          }
+        : await getPricingConfig(pool),
+    )
     res.status(200).json({
-      message: "Precios actualizados exitosamente",
-      producto: existingProduct[0],
-      precio_costo_nuevo: precio_costo,
-      precio_venta_nuevo: finalPrecioVenta,
+      message: "Precios del producto actualizados exitosamente",
+      precio_venta_calculado: finalPrecioVenta,
       desglose_calculo: breakdown,
+      configuracion_usada: customConfig ? "personalizada" : "global",
     })
   } catch (error) {
     console.error("Error al actualizar precios del producto:", error)
     res.status(500).json({ message: "Error al actualizar precios del producto" })
-  }
-}
-
-// Eliminar un producto (eliminación lógica o permanente)
-export const deleteProduct = async (req, res) => {
-  const connection = await pool.getConnection()
-  try {
-    await connection.beginTransaction()
-    const { id } = req.params
-
-    // Eliminar movimientos de stock asociados
-    await connection.query("DELETE FROM movimientos_stock WHERE producto_id = ?", [id])
-    // Eliminar el producto
-    const [result] = await connection.query("DELETE FROM productos WHERE id = ?", [id])
-
-    if (result.affectedRows === 0) {
-      await connection.rollback()
-      return res.status(404).json({ message: "Producto no encontrado" })
-    }
-
-    await connection.commit()
-    res.status(200).json({ message: "Producto eliminado permanentemente" })
-  } catch (error) {
-    await connection.rollback()
-    console.error("Error al eliminar producto:", error)
-    res.status(500).json({ message: "Error al eliminar producto" })
-  } finally {
-    connection.release()
-  }
-}
-
-// Validar si un código de producto es único
-export const validateProductCode = async (req, res) => {
-  try {
-    const { code, excludeId = null } = req.body
-    if (!code) {
-      return res.status(400).json({ message: "El código es requerido" })
-    }
-
-    let query = "SELECT id FROM productos WHERE codigo = ?"
-    const params = [code]
-    if (excludeId) {
-      query += " AND id != ?"
-      params.push(excludeId)
-    }
-
-    const [existing] = await pool.query(query, params)
-    res.status(200).json({ isUnique: existing.length === 0 })
-  } catch (error) {
-    console.error("Error al validar código de producto:", error)
-    res.status(500).json({ message: "Error al validar código de producto" })
-  }
-}
-
-// Obtener desglose de cálculo de un producto específico
-export const getProductPriceBreakdown = async (req, res) => {
-  try {
-    const { id } = req.params
-    const [products] = await pool.query("SELECT precio_costo FROM productos WHERE id = ?", [id])
-
-    if (products.length === 0) {
-      return res.status(404).json({ message: "Producto no encontrado" })
-    }
-
-    // Validar precio de costo
-    if (!isValidPrice(products[0].precio_costo)) {
-      return res.status(400).json({ message: "El producto tiene un precio de costo inválido" })
-    }
-
-    // Usar la lógica centralizada de precios
-    const pricingConfig = await getPricingConfig(pool)
-    const breakdown = getPriceBreakdown(products[0].precio_costo, pricingConfig)
-
-    res.status(200).json({
-      message: "Desglose de cálculo obtenido exitosamente",
-      desglose: breakdown,
-    })
-  } catch (error) {
-    console.error("Error al obtener desglose de precios:", error)
-    res.status(500).json({ message: "Error al obtener desglose de precios" })
-  }
-}
-
-export const searchProducts = async (req, res) => {
-  try {
-    const { search = "", limit = 10, includeOutOfStock = true } = req.query
-
-    console.log("searchProducts called with:", { search, limit, includeOutOfStock })
-
-    if (!search || search.trim().length < 2) {
-      return res.status(400).json({
-        success: false,
-        message: "El término de búsqueda debe tener al menos 2 caracteres",
-      })
-    }
-
-    let baseQuery = `
-      SELECT 
-        p.id, p.codigo, p.nombre, p.descripcion, p.marca, p.stock, p.stock_minimo,
-        p.precio_costo, p.precio_venta, p.tiene_codigo_barras as tieneCodigoBarras,
-        p.fecha_ingreso as fechaIngreso, p.activo, p.categoria_id, p.proveedor_id,
-        COALESCE(c.nombre, 'Sin Categoría') as categoria_nombre,
-        COALESCE(pr.nombre, 'Sin Proveedor') as proveedor_nombre
-      FROM productos p
-      LEFT JOIN categorias c ON p.categoria_id = c.id
-      LEFT JOIN proveedores pr ON p.proveedor_id = pr.id
-      WHERE p.activo = TRUE
-    `
-
-    const queryParams = []
-    const searchTerm = `%${search.trim()}%`
-
-    // Búsqueda en múltiples campos
-    baseQuery += ` AND (
-      p.codigo LIKE ? OR 
-      p.nombre LIKE ? OR 
-      p.descripcion LIKE ? OR 
-      p.marca LIKE ? OR
-      c.nombre LIKE ?
-    )`
-    queryParams.push(searchTerm, searchTerm, searchTerm, searchTerm, searchTerm)
-
-    // Filtro de stock si se especifica
-    if (includeOutOfStock === "false") {
-      baseQuery += ` AND p.stock > 0`
-    }
-
-    // Ordenar por relevancia: primero por código exacto, luego por nombre
-    baseQuery += ` ORDER BY 
-      CASE WHEN p.codigo = ? THEN 1 ELSE 2 END,
-      CASE WHEN p.nombre LIKE ? THEN 1 ELSE 2 END,
-      p.nombre ASC
-    `
-    queryParams.push(search.trim(), `${search.trim()}%`)
-
-    // Limitar resultados
-    baseQuery += ` LIMIT ?`
-    queryParams.push(Number.parseInt(limit))
-
-    console.log("Executing search query with params:", queryParams)
-
-    const [products] = await pool.query(baseQuery, queryParams)
-
-    console.log(`Found ${products.length} products for search: "${search}"`)
-
-    res.status(200).json({
-      success: true,
-      data: products,
-      searchTerm: search,
-      totalResults: products.length,
-    })
-  } catch (error) {
-    console.error("Error en búsqueda de productos:", error)
-    res.status(500).json({
-      success: false,
-      message: "Error en la búsqueda de productos",
-      error: error.message,
-    })
   }
 }
