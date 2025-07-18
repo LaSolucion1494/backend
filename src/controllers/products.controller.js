@@ -574,3 +574,164 @@ export const updateProductPrices = async (req, res) => {
     res.status(500).json({ message: "Error al actualizar precios del producto" })
   }
 }
+
+// Eliminar un producto
+export const deleteProduct = async (req, res) => {
+  try {
+    const { id } = req.params
+
+    // Validar que el producto existe
+    const [existingProduct] = await pool.query("SELECT id, nombre, codigo FROM productos WHERE id = ?", [id])
+    if (existingProduct.length === 0) {
+      return res.status(404).json({ message: "Producto no encontrado" })
+    }
+
+    const product = existingProduct[0]
+
+    // Verificar si el producto tiene movimientos de stock o está en ventas
+    const [stockMovements] = await pool.query("SELECT COUNT(*) as count FROM movimientos_stock WHERE producto_id = ?", [
+      id,
+    ])
+    const [salesItems] = await pool.query("SELECT COUNT(*) as count FROM detalle_ventas WHERE producto_id = ?", [id])
+
+    if (stockMovements[0].count > 0 || salesItems[0].count > 0) {
+      // Si tiene movimientos o ventas, marcar como inactivo en lugar de eliminar
+      await pool.query("UPDATE productos SET activo = FALSE WHERE id = ?", [id])
+
+      res.status(200).json({
+        message: `Producto "${product.nombre}" desactivado exitosamente. No se puede eliminar porque tiene historial de movimientos o ventas.`,
+        action: "deactivated",
+      })
+    } else {
+      // Si no tiene historial, eliminar completamente
+      await pool.query("DELETE FROM productos WHERE id = ?", [id])
+
+      res.status(200).json({
+        message: `Producto "${product.nombre}" eliminado exitosamente`,
+        action: "deleted",
+      })
+    }
+  } catch (error) {
+    console.error("Error al eliminar producto:", error)
+    res.status(500).json({ message: "Error al eliminar producto" })
+  }
+}
+
+// Validar código único de producto
+export const validateProductCode = async (req, res) => {
+  try {
+    const { code, excludeId = null } = req.body
+
+    if (!code || code.trim() === "") {
+      return res.status(400).json({ message: "El código es requerido" })
+    }
+
+    let query = "SELECT id FROM productos WHERE codigo = ?"
+    const params = [code.trim()]
+
+    if (excludeId) {
+      query += " AND id != ?"
+      params.push(excludeId)
+    }
+
+    const [existingProduct] = await pool.query(query, params)
+    const isUnique = existingProduct.length === 0
+
+    res.status(200).json({
+      isUnique,
+      message: isUnique ? "Código disponible" : "El código ya existe",
+    })
+  } catch (error) {
+    console.error("Error al validar código:", error)
+    res.status(500).json({ message: "Error al validar código" })
+  }
+}
+
+// Obtener desglose de precios de un producto
+export const getProductPriceBreakdown = async (req, res) => {
+  try {
+    const { id } = req.params
+
+    const [products] = await pool.query("SELECT precio_costo, custom_pricing_config FROM productos WHERE id = ?", [id])
+
+    if (products.length === 0) {
+      return res.status(404).json({ message: "Producto no encontrado" })
+    }
+
+    const product = products[0]
+
+    // Obtener configuración de precios para este producto
+    const pricingConfig = await getProductPricingConfig(product, pool)
+
+    // Generar desglose
+    const breakdown = getPriceBreakdown(product.precio_costo, pricingConfig)
+
+    res.status(200).json({
+      breakdown,
+      config: pricingConfig,
+    })
+  } catch (error) {
+    console.error("Error al obtener desglose de precios:", error)
+    res.status(500).json({ message: "Error al obtener desglose de precios" })
+  }
+}
+
+// Búsqueda de productos (para modales y búsquedas rápidas)
+export const searchProducts = async (req, res) => {
+  try {
+    const { search = "", limit = 50 } = req.query
+
+    if (!search || search.trim().length < 2) {
+      return res.status(200).json({
+        success: true,
+        data: [],
+        message: "Término de búsqueda muy corto",
+      })
+    }
+
+    const searchTerm = `%${search.trim()}%`
+    const [products] = await pool.query(
+      `
+      SELECT 
+        p.id, p.codigo, p.nombre, p.descripcion, p.marca, p.stock, p.stock_minimo,
+        p.precio_costo, p.precio_venta, p.custom_pricing_config, p.tiene_codigo_barras as tieneCodigoBarras,
+        p.fecha_ingreso as fechaIngreso, p.activo, p.categoria_id, p.proveedor_id,
+        COALESCE(c.nombre, 'Sin Categoría') as categoria_nombre,
+        COALESCE(pr.nombre, 'Sin Proveedor') as proveedor
+      FROM productos p
+      LEFT JOIN categorias c ON p.categoria_id = c.id
+      LEFT JOIN proveedores pr ON p.proveedor_id = pr.id
+      WHERE p.activo = TRUE 
+      AND (p.codigo LIKE ? OR p.nombre LIKE ? OR p.descripcion LIKE ? OR p.marca LIKE ?)
+      ORDER BY p.nombre ASC
+      LIMIT ?
+    `,
+      [searchTerm, searchTerm, searchTerm, searchTerm, Number.parseInt(limit)],
+    )
+
+    // Parsear configuración personalizada para cada producto
+    products.forEach((product) => {
+      if (product.custom_pricing_config) {
+        try {
+          product.custom_pricing_config = JSON.parse(product.custom_pricing_config)
+        } catch (error) {
+          console.error("Error parsing custom pricing config for product", product.id, error)
+          product.custom_pricing_config = null
+        }
+      }
+    })
+
+    res.status(200).json({
+      success: true,
+      data: products,
+      searchTerm: search.trim(),
+      totalResults: products.length,
+    })
+  } catch (error) {
+    console.error("Error en búsqueda de productos:", error)
+    res.status(500).json({
+      success: false,
+      message: "Error en la búsqueda de productos",
+    })
+  }
+}
