@@ -7,7 +7,7 @@ export const getPricingConfig = async (connection) => {
   try {
     const [configRows] = await connection.query(`
       SELECT clave, valor, tipo FROM configuracion 
-      WHERE clave IN ('rentabilidad', 'iva', 'ingresos_brutos', 'otros_impuestos')
+      WHERE clave IN ('rentabilidad', 'iva', 'ingresos_brutos', 'otros_impuestos', 'stock_minimo_default')
     `)
 
     // Configuración por defecto con valores seguros
@@ -16,6 +16,7 @@ export const getPricingConfig = async (connection) => {
       iva: 21,
       ingresos_brutos: 0,
       otros_impuestos: 0,
+      stock_minimo: 5,
     }
 
     configRows.forEach((item) => {
@@ -23,7 +24,9 @@ export const getPricingConfig = async (connection) => {
         const parsedValue = Number.parseFloat(item.valor)
         // Solo asignar si el valor parseado es un número válido
         if (!isNaN(parsedValue) && isFinite(parsedValue)) {
-          config[item.clave] = parsedValue
+          // Mapear stock_minimo_default a stock_minimo para compatibilidad
+          const key = item.clave === "stock_minimo_default" ? "stock_minimo" : item.clave
+          config[key] = parsedValue
         } else {
           console.warn(`Valor inválido para configuración ${item.clave}: ${item.valor}. Usando valor por defecto.`)
         }
@@ -48,12 +51,16 @@ export const getPricingConfig = async (connection) => {
           case "otros_impuestos":
             config[key] = 0
             break
+          case "stock_minimo":
+            config[key] = 1
+            break
           default:
             config[key] = 0
         }
       }
     })
 
+   
     return config
   } catch (error) {
     console.error("Error al obtener configuración de precios:", error)
@@ -63,6 +70,7 @@ export const getPricingConfig = async (connection) => {
       iva: 21,
       ingresos_brutos: 0,
       otros_impuestos: 0,
+      stock_minimo: 1,
     }
   }
 }
@@ -101,6 +109,7 @@ export const calculateSalePrice = (costPrice, config) => {
     otros_impuestos: validateNumber(config?.otros_impuestos, 0),
   }
 
+
   try {
     // 1. Calcular la rentabilidad sobre el costo
     const rentabilidadMonto = validCostPrice * (validConfig.rentabilidad / 100)
@@ -130,7 +139,8 @@ export const calculateSalePrice = (costPrice, config) => {
       return 0
     }
 
-    return Math.round(precioFinal * 100) / 100
+    const resultado = Math.round(precioFinal * 100) / 100
+    return resultado
   } catch (error) {
     console.error("Error al calcular precio de venta:", error, {
       costPrice: validCostPrice,

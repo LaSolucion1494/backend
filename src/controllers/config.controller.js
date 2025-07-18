@@ -27,6 +27,7 @@ const recalculateAllProductPrices = async (connection) => {
   try {
     // 1. Obtener la configuración de precios más reciente
     const pricingConfig = await getPricingConfig(connection)
+
     // 2. Obtener todos los productos activos que necesitan actualización
     const [products] = await connection.query(`
       SELECT id, codigo, nombre, precio_costo 
@@ -44,6 +45,7 @@ const recalculateAllProductPrices = async (connection) => {
         message: "No hay productos activos para actualizar",
       }
     }
+
     // 3. Procesar productos en lotes para evitar problemas de memoria
     const batchSize = 100
     for (let i = 0; i < products.length; i += batchSize) {
@@ -76,7 +78,6 @@ const recalculateAllProductPrices = async (connection) => {
           await connection.query("UPDATE productos SET precio_venta = ? WHERE id = ?", [newSalePrice, product.id])
 
           updatedCount++
-
         } catch (productError) {
           const error = `Error procesando producto ID ${product.id} (${product.codigo}): ${productError.message}`
           console.error(error)
@@ -87,6 +88,7 @@ const recalculateAllProductPrices = async (connection) => {
     }
 
     const executionTime = Date.now() - startTime
+
     return {
       updatedCount,
       errorCount,
@@ -147,6 +149,7 @@ export const updateConfig = async (req, res) => {
     const pricingKeys = ["rentabilidad", "iva", "ingresos_brutos", "otros_impuestos"]
     let pricingConfigChanged = false
 
+
     // Validar y actualizar configuraciones
     for (const config of configs) {
       const { clave, valor } = config
@@ -163,14 +166,29 @@ export const updateConfig = async (req, res) => {
         pricingConfigChanged = true
       }
 
-      await connection.query("UPDATE configuracion SET valor = ? WHERE clave = ?", [valor.toString(), clave])
+      // Asegurar que la configuración existe antes de actualizarla
+      const [existing] = await connection.query("SELECT id FROM configuracion WHERE clave = ?", [clave])
+
+      if (existing.length === 0) {
+        // Insertar nueva configuración
+        await connection.query("INSERT INTO configuracion (clave, valor, tipo) VALUES (?, ?, ?)", [
+          clave,
+          valor.toString(),
+          pricingKeys.includes(clave) ? "numero" : "texto",
+        ])
+      } else {
+        // Actualizar configuración existente
+        await connection.query("UPDATE configuracion SET valor = ? WHERE clave = ?", [valor.toString(), clave])
+      }
     }
 
     let recalculateResult = null
     // Si una configuración de precios cambió y se solicitó recalcular
     if (pricingConfigChanged && recalculatePrices) {
       try {
+
         recalculateResult = await recalculateAllProductPrices(connection)
+     
       } catch (recalculateError) {
         console.error("Error durante recálculo:", recalculateError)
         await connection.rollback()
