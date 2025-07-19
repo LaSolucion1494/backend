@@ -676,20 +676,25 @@ export const getProductPriceBreakdown = async (req, res) => {
   }
 }
 
-// Búsqueda de productos (para modales y búsquedas rápidas)
+// Mejorar la función searchProducts para que sea más eficiente y progresiva:
+
+// Búsqueda de productos (para modales y búsquedas rápidas) - MEJORADA
 export const searchProducts = async (req, res) => {
   try {
     const { search = "", limit = 50 } = req.query
 
-    if (!search || search.trim().length < 2) {
+    if (!search || search.trim().length < 1) {
       return res.status(200).json({
         success: true,
         data: [],
-        message: "Término de búsqueda muy corto",
+        message: "Término de búsqueda requerido",
       })
     }
 
-    const searchTerm = `%${search.trim()}%`
+    const searchTerm = search.trim()
+    const searchPattern = `%${searchTerm}%`
+
+    // Query optimizada con relevancia
     const [products] = await pool.query(
       `
       SELECT 
@@ -697,16 +702,54 @@ export const searchProducts = async (req, res) => {
         p.precio_costo, p.precio_venta, p.custom_pricing_config, p.tiene_codigo_barras as tieneCodigoBarras,
         p.fecha_ingreso as fechaIngreso, p.activo, p.categoria_id, p.proveedor_id,
         COALESCE(c.nombre, 'Sin Categoría') as categoria_nombre,
-        COALESCE(pr.nombre, 'Sin Proveedor') as proveedor
+        COALESCE(pr.nombre, 'Sin Proveedor') as proveedor,
+        -- Calcular relevancia para ordenamiento
+        CASE 
+          WHEN p.codigo = ? THEN 100
+          WHEN p.codigo LIKE CONCAT(?, '%') THEN 90
+          WHEN p.codigo LIKE ? THEN 80
+          WHEN p.nombre = ? THEN 70
+          WHEN p.nombre LIKE CONCAT(?, '%') THEN 60
+          WHEN p.nombre LIKE ? THEN 50
+          WHEN p.descripcion LIKE CONCAT(?, '%') THEN 40
+          WHEN p.descripcion LIKE ? THEN 30
+          WHEN p.marca LIKE CONCAT(?, '%') THEN 20
+          WHEN p.marca LIKE ? THEN 10
+          ELSE 0
+        END as relevancia
       FROM productos p
       LEFT JOIN categorias c ON p.categoria_id = c.id
       LEFT JOIN proveedores pr ON p.proveedor_id = pr.id
       WHERE p.activo = TRUE 
-      AND (p.codigo LIKE ? OR p.nombre LIKE ? OR p.descripcion LIKE ? OR p.marca LIKE ?)
-      ORDER BY p.nombre ASC
+      AND (
+        p.codigo LIKE ? OR 
+        p.nombre LIKE ? OR 
+        p.descripcion LIKE ? OR 
+        p.marca LIKE ?
+      )
+      ORDER BY relevancia DESC, p.nombre ASC
       LIMIT ?
     `,
-      [searchTerm, searchTerm, searchTerm, searchTerm, Number.parseInt(limit)],
+      [
+        // Para cálculo de relevancia
+        searchTerm,
+        searchTerm,
+        searchPattern, // código
+        searchTerm,
+        searchTerm,
+        searchPattern, // nombre
+        searchTerm,
+        searchPattern, // descripción
+        searchTerm,
+        searchPattern, // marca
+        // Para filtrado
+        searchPattern,
+        searchPattern,
+        searchPattern,
+        searchPattern,
+        // Límite
+        Number.parseInt(limit),
+      ],
     )
 
     // Parsear configuración personalizada para cada producto
@@ -719,12 +762,14 @@ export const searchProducts = async (req, res) => {
           product.custom_pricing_config = null
         }
       }
+      // Remover el campo de relevancia del resultado final
+      delete product.relevancia
     })
 
     res.status(200).json({
       success: true,
       data: products,
-      searchTerm: search.trim(),
+      searchTerm: searchTerm,
       totalResults: products.length,
     })
   } catch (error) {
