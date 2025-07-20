@@ -17,7 +17,8 @@ import salesRoutes from "./routes/sales.routes.js"
 import cashClosingRoutes from "./routes/cashClosing.routes.js"
 import cuentaCorrienteRoutes from "./routes/cuentaCorriente.routes.js"
 import dashboardRoutes from "./routes/dashboard.routes.js"
-import presupuestosRoutes from "./routes/presupuestos.routes.js" // NUEVO: Importar rutas de presupuestos
+import presupuestosRoutes from "./routes/presupuestos.routes.js"
+import cotizacionesRoutes from "./routes/cotizaciones.routes.js" // NUEVO: Importar rutas de cotizaciones
 
 const app = express()
 
@@ -61,7 +62,8 @@ app.use("/api/sales", salesRoutes)
 app.use("/api/cash-closing", cashClosingRoutes)
 app.use("/api/cuenta-corriente", cuentaCorrienteRoutes)
 app.use("/api/dashboard", dashboardRoutes)
-app.use("/api/presupuestos", presupuestosRoutes) // NUEVO: Usar rutas de presupuestos
+app.use("/api/presupuestos", presupuestosRoutes)
+app.use("/api/cotizaciones", cotizacionesRoutes) // NUEVO: Usar rutas de cotizaciones
 
 // Middleware para manejar errores
 app.use((err, req, res, next) => {
