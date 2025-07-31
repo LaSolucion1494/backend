@@ -60,7 +60,6 @@ export const getPricingConfig = async (connection) => {
       }
     })
 
-   
     return config
   } catch (error) {
     console.error("Error al obtener configuración de precios:", error)
@@ -88,7 +87,7 @@ const validateNumber = (value, defaultValue = 0) => {
 
 /**
  * Calcula el precio de venta final basado en el costo y la configuración.
- * Esta es la fórmula central para todo el sistema.
+ * NUEVA LÓGICA: Costo → +Ingresos Brutos → +IVA → +Rentabilidad → +Otros Impuestos
  * @param {number} costPrice - El precio de costo del producto.
  * @param {object} config - El objeto de configuración de precios.
  * @returns {number} El precio de venta final, redondeado a 2 decimales.
@@ -109,25 +108,32 @@ export const calculateSalePrice = (costPrice, config) => {
     otros_impuestos: validateNumber(config?.otros_impuestos, 0),
   }
 
-
   try {
-    // 1. Calcular la rentabilidad sobre el costo
-    const rentabilidadMonto = validCostPrice * (validConfig.rentabilidad / 100)
+    // NUEVA LÓGICA DE CÁLCULO:
 
-    // 2. Calcular ingresos brutos sobre el costo
+    // 1. Calcular ingresos brutos sobre el costo base
     const ingresosBrutosMonto = validCostPrice * (validConfig.ingresos_brutos / 100)
 
-    // 3. Calcular otros impuestos sobre el costo
-    const otrosImpuestosMonto = validCostPrice * (validConfig.otros_impuestos / 100)
+    // 2. Subtotal con ingresos brutos
+    const subtotalConIngresosBrutos = validCostPrice + ingresosBrutosMonto
 
-    // 4. Calcular precio neto (sin IVA)
-    const precioNeto = validCostPrice + rentabilidadMonto + ingresosBrutosMonto + otrosImpuestosMonto
+    // 3. Calcular IVA sobre el subtotal (costo + ingresos brutos)
+    const ivaMonto = subtotalConIngresosBrutos * (validConfig.iva / 100)
 
-    // 5. Calcular IVA sobre el precio neto
-    const ivaMonto = precioNeto * (validConfig.iva / 100)
+    // 4. Subtotal con impuestos básicos (costo + ingresos brutos + IVA)
+    const subtotalConImpuestosBasicos = subtotalConIngresosBrutos + ivaMonto
 
-    // 6. Precio final de venta
-    const precioFinal = precioNeto + ivaMonto
+    // 5. Calcular rentabilidad sobre el subtotal con impuestos básicos
+    const rentabilidadMonto = subtotalConImpuestosBasicos * (validConfig.rentabilidad / 100)
+
+    // 6. Subtotal con rentabilidad
+    const subtotalConRentabilidad = subtotalConImpuestosBasicos + rentabilidadMonto
+
+    // 7. Calcular otros impuestos sobre el resultado con rentabilidad
+    const otrosImpuestosMonto = subtotalConRentabilidad * (validConfig.otros_impuestos / 100)
+
+    // 8. Precio final
+    const precioFinal = subtotalConRentabilidad + otrosImpuestosMonto
 
     // Validar que el resultado final sea un número válido
     if (isNaN(precioFinal) || !isFinite(precioFinal) || precioFinal < 0) {
@@ -152,6 +158,7 @@ export const calculateSalePrice = (costPrice, config) => {
 
 /**
  * Genera un desglose detallado del cálculo del precio.
+ * NUEVA LÓGICA: Costo → +Ingresos Brutos → +IVA → +Rentabilidad → +Otros Impuestos
  * @param {number} costPrice - El precio de costo del producto.
  * @param {object} config - El objeto de configuración de precios.
  * @returns {object} Un objeto con el desglose del precio.
@@ -163,11 +170,13 @@ export const getPriceBreakdown = (costPrice, config) => {
   if (validCostPrice <= 0) {
     return {
       costo: 0,
-      rentabilidad: 0,
       ingresosBrutos: 0,
-      otrosImpuestos: 0,
-      precioNeto: 0,
+      subtotalConIngresosBrutos: 0,
       iva: 0,
+      subtotalConImpuestosBasicos: 0,
+      rentabilidad: 0,
+      subtotalConRentabilidad: 0,
+      otrosImpuestos: 0,
       precioFinal: 0,
       porcentajes: {
         rentabilidad: 40,
@@ -187,20 +196,33 @@ export const getPriceBreakdown = (costPrice, config) => {
   }
 
   try {
-    const rentabilidadMonto = validCostPrice * (validConfig.rentabilidad / 100)
+    // NUEVA LÓGICA DE CÁLCULO CON DESGLOSE DETALLADO:
+
+    // 1. Ingresos brutos sobre costo base
     const ingresosBrutosMonto = validCostPrice * (validConfig.ingresos_brutos / 100)
-    const otrosImpuestosMonto = validCostPrice * (validConfig.otros_impuestos / 100)
-    const precioNeto = validCostPrice + rentabilidadMonto + ingresosBrutosMonto + otrosImpuestosMonto
-    const ivaMonto = precioNeto * (validConfig.iva / 100)
-    const precioFinal = precioNeto + ivaMonto
+    const subtotalConIngresosBrutos = validCostPrice + ingresosBrutosMonto
+
+    // 2. IVA sobre (costo + ingresos brutos)
+    const ivaMonto = subtotalConIngresosBrutos * (validConfig.iva / 100)
+    const subtotalConImpuestosBasicos = subtotalConIngresosBrutos + ivaMonto
+
+    // 3. Rentabilidad sobre (costo + ingresos brutos + IVA)
+    const rentabilidadMonto = subtotalConImpuestosBasicos * (validConfig.rentabilidad / 100)
+    const subtotalConRentabilidad = subtotalConImpuestosBasicos + rentabilidadMonto
+
+    // 4. Otros impuestos sobre el resultado con rentabilidad
+    const otrosImpuestosMonto = subtotalConRentabilidad * (validConfig.otros_impuestos / 100)
+    const precioFinal = subtotalConRentabilidad + otrosImpuestosMonto
 
     return {
       costo: Math.round(validCostPrice * 100) / 100,
-      rentabilidad: Math.round(rentabilidadMonto * 100) / 100,
       ingresosBrutos: Math.round(ingresosBrutosMonto * 100) / 100,
-      otrosImpuestos: Math.round(otrosImpuestosMonto * 100) / 100,
-      precioNeto: Math.round(precioNeto * 100) / 100,
+      subtotalConIngresosBrutos: Math.round(subtotalConIngresosBrutos * 100) / 100,
       iva: Math.round(ivaMonto * 100) / 100,
+      subtotalConImpuestosBasicos: Math.round(subtotalConImpuestosBasicos * 100) / 100,
+      rentabilidad: Math.round(rentabilidadMonto * 100) / 100,
+      subtotalConRentabilidad: Math.round(subtotalConRentabilidad * 100) / 100,
+      otrosImpuestos: Math.round(otrosImpuestosMonto * 100) / 100,
       precioFinal: Math.round(precioFinal * 100) / 100,
       porcentajes: validConfig,
     }
@@ -208,11 +230,13 @@ export const getPriceBreakdown = (costPrice, config) => {
     console.error("Error al generar desglose de precios:", error)
     return {
       costo: validCostPrice,
-      rentabilidad: 0,
       ingresosBrutos: 0,
-      otrosImpuestos: 0,
-      precioNeto: validCostPrice,
+      subtotalConIngresosBrutos: validCostPrice,
       iva: 0,
+      subtotalConImpuestosBasicos: validCostPrice,
+      rentabilidad: 0,
+      subtotalConRentabilidad: validCostPrice,
+      otrosImpuestos: 0,
       precioFinal: validCostPrice,
       porcentajes: validConfig,
     }
